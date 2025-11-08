@@ -127,7 +127,7 @@ Create `/etc/systemd/system/sdhm.service`:
 
 ```ini
 [Unit]
-Description=Salty Docker Hosts Manager
+Description=Saltbox Docker Hosts Manager
 After=docker.service
 Requires=docker.service
 
