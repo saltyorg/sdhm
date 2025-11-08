@@ -1,0 +1,148 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	"github.com/saltyorg/sdhm/internal/config"
+	"github.com/saltyorg/sdhm/internal/timeutil"
+	"github.com/saltyorg/sdhm/internal/updater"
+
+	"github.com/spf13/cobra"
+)
+
+var (
+	intervalStr         string
+	healthCheckPort     int
+	healthCheckAddr     string
+	hostsFilePath       string
+	backupFilePath      string
+	networksStr         string
+	sectionName         string
+	debounceDelayStr    string
+	maxDebounceDelayStr string
+	version             = "0.0.0.0-dev"
+)
+
+func main() {
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+var rootCmd = &cobra.Command{
+	Use:   "sdhm",
+	Short: "Automatically updates /etc/hosts with Docker container hostnames",
+	Long: `A daemon that monitors Docker network events and automatically updates
+/etc/hosts with container hostnames on a specified network.
+
+Features:
+  - Monitors Docker network events (connect/disconnect)
+  - Updates /etc/hosts with debounced event handling
+  - Periodic validation to ensure sync
+  - Health check endpoint for monitoring
+  - Automatic recovery from corrupted hosts files`,
+	Version: version,
+	RunE:    run,
+}
+
+func init() {
+	rootCmd.Flags().StringVarP(&intervalStr, "interval", "i", "5m", "Periodic validation interval (e.g., 30s, 5m, 1h, 1d)")
+	rootCmd.Flags().IntVarP(&healthCheckPort, "health-port", "p", 8080, "Health check HTTP server port")
+	rootCmd.Flags().StringVar(&healthCheckAddr, "health-addr", "127.0.0.1", "IP address to bind health check server (e.g., 127.0.0.1, 0.0.0.0)")
+	rootCmd.Flags().StringVar(&hostsFilePath, "hosts-file", "/etc/hosts", "Path to hosts file (useful for testing)")
+	rootCmd.Flags().StringVar(&backupFilePath, "backup-file", "/etc/hosts.backup", "Path to backup file")
+	rootCmd.Flags().StringVarP(&networksStr, "networks", "n", "saltbox", "Comma-separated list of Docker networks to monitor (e.g., 'saltbox,bridge')")
+	rootCmd.Flags().StringVar(&sectionName, "section-name", "DOCKER CONTAINERS", "Name for managed section in hosts file (markers auto-generated as '# BEGIN/END <name>')")
+	rootCmd.Flags().StringVar(&debounceDelayStr, "debounce-delay", "1s", "Debounce delay (e.g., 500ms, 1s, 2s)")
+	rootCmd.Flags().StringVar(&maxDebounceDelayStr, "debounce-max-delay", "5s", "Maximum debounce delay (e.g., 3s, 5s, 10s)")
+}
+
+func run(cmd *cobra.Command, args []string) error {
+	logger := log.New(os.Stdout, "", log.LstdFlags)
+
+	// Check if running as root
+	if os.Geteuid() != 0 {
+		logger.Println("WARN: This program should be run as root to modify /etc/hosts")
+	}
+
+	// Parse interval
+	interval, err := timeutil.ParseDuration(intervalStr)
+	if err != nil {
+		return fmt.Errorf("invalid interval '%s': %w\n\nInterval format:\n  s = seconds (e.g., 30s)\n  m = minutes (e.g., 5m)\n  h = hours   (e.g., 1h)\n  d = days    (e.g., 1d)", intervalStr, err)
+	}
+
+	// Parse debounce delay
+	debounceDelay, err := timeutil.ParseDuration(debounceDelayStr)
+	if err != nil {
+		return fmt.Errorf("invalid debounce-delay '%s': %w", debounceDelayStr, err)
+	}
+
+	// Parse max debounce delay
+	maxDebounceDelay, err := timeutil.ParseDuration(maxDebounceDelayStr)
+	if err != nil {
+		return fmt.Errorf("invalid debounce-max-delay '%s': %w", maxDebounceDelayStr, err)
+	}
+
+	// Parse networks (comma-separated)
+	networks := strings.Split(networksStr, ",")
+	for i := range networks {
+		networks[i] = strings.TrimSpace(networks[i])
+	}
+	// Filter out empty strings
+	var filteredNetworks []string
+	for _, network := range networks {
+		if network != "" {
+			filteredNetworks = append(filteredNetworks, network)
+		}
+	}
+	if len(filteredNetworks) == 0 {
+		return fmt.Errorf("at least one network must be specified")
+	}
+
+	logger.Printf("INFO: Starting sdhm")
+	logger.Printf("INFO: Monitoring networks: %v", filteredNetworks)
+	logger.Printf("INFO: Interval: %s, Health check: %s:%d", interval, healthCheckAddr, healthCheckPort)
+
+	// Create configuration
+	cfg := config.NewConfig(interval)
+	cfg.HealthCheckPort = healthCheckPort
+	cfg.HealthCheckAddr = healthCheckAddr
+	cfg.HostsFile = hostsFilePath
+	cfg.BackupFile = backupFilePath
+	cfg.DockerNetworks = filteredNetworks
+	cfg.ManagedSectionName = sectionName
+	cfg.DebounceDelay = debounceDelay
+	cfg.MaxDebounceDelay = maxDebounceDelay
+
+	// Create updater
+	u, err := updater.NewUpdater(cfg, logger)
+	if err != nil {
+		return fmt.Errorf("failed to create updater: %w", err)
+	}
+	defer u.Close()
+
+	// Set up signal handling
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	// Handle signals in separate goroutine
+	go func() {
+		<-ctx.Done()
+		logger.Println("INFO: Received shutdown signal")
+		u.Shutdown()
+	}()
+
+	// Start the updater (blocks until shutdown)
+	if err := u.Start(ctx); err != nil {
+		return fmt.Errorf("updater failed: %w", err)
+	}
+
+	logger.Println("INFO: Shutdown complete")
+	return nil
+}
