@@ -114,8 +114,11 @@ curl http://127.0.0.1:8080/health
 Response:
 ```json
 {
-  "status": "ok",
-  "uptime": "1h23m45s"
+  "error_count": 0,
+  "errors": [],
+  "healthy": true,
+  "message": "No errors recorded",
+  "status": "ok"
 }
 ```
 
