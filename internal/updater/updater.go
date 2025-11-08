@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/moby/moby/api/types/events"
 	"github.com/saltyorg/sdhm/internal/config"
 	"github.com/saltyorg/sdhm/internal/debounce"
 	"github.com/saltyorg/sdhm/internal/docker"
@@ -17,8 +18,12 @@ import (
 const (
 	// DockerOperationTimeout is the timeout for Docker API operations
 	DockerOperationTimeout = 10 * time.Second
-	// EventStreamReconnectDelay is the delay before reconnecting to Docker event stream after an error
-	EventStreamReconnectDelay = 5 * time.Second
+	// EventStreamInitialBackoff is the initial delay before reconnecting to Docker event stream
+	EventStreamInitialBackoff = 1 * time.Second
+	// EventStreamMaxBackoff is the maximum delay before reconnecting to Docker event stream
+	EventStreamMaxBackoff = 30 * time.Second
+	// EventStreamBackoffMultiplier is the multiplier for exponential backoff
+	EventStreamBackoffMultiplier = 2
 )
 
 // Updater coordinates the hosts file updates
@@ -333,26 +338,55 @@ func (u *Updater) periodicUpdater(ctx context.Context) {
 	}
 }
 
-// eventMonitor monitors Docker events
+// eventMonitor monitors Docker events with automatic reconnection
 func (u *Updater) eventMonitor(ctx context.Context) {
 	defer u.wg.Done()
 
 	u.logger.Println("INFO: Monitoring Docker network events (connect, disconnect)")
 
-	eventCh, errCh := u.dockerClient.MonitorEvents(ctx)
+	backoff := EventStreamInitialBackoff
+	var eventCh <-chan events.Message
+	var errCh <-chan error
 
 	for {
+		// Establish or re-establish connection to Docker event stream
+		if eventCh == nil {
+			u.logger.Println("INFO: Connecting to Docker event stream")
+			eventCh, errCh = u.dockerClient.MonitorEvents(ctx)
+			// Reset backoff on successful connection
+			backoff = EventStreamInitialBackoff
+		}
+
 		select {
 		case <-ctx.Done():
 			u.logger.Println("INFO: Event monitor stopped")
 			return
+
 		case err := <-errCh:
 			if err != nil {
 				u.healthCheck.RecordError("docker_events", fmt.Sprintf("event stream error: %v", err))
 				u.logger.Printf("ERROR: Docker event stream error: %v", err)
-				// Brief delay before reconnecting
-				time.Sleep(EventStreamReconnectDelay)
+
+				// Mark channels as dead so we reconnect on next iteration
+				eventCh = nil
+				errCh = nil
+
+				// Exponential backoff before reconnecting
+				u.logger.Printf("INFO: Reconnecting to Docker event stream in %v", backoff)
+
+				select {
+				case <-time.After(backoff):
+					// Increase backoff for next potential failure
+					backoff *= EventStreamBackoffMultiplier
+					if backoff > EventStreamMaxBackoff {
+						backoff = EventStreamMaxBackoff
+					}
+				case <-ctx.Done():
+					u.logger.Println("INFO: Event monitor stopped during reconnection backoff")
+					return
+				}
 			}
+
 		case event := <-eventCh:
 			// All events are network events (connect/disconnect)
 			// The "container" attribute contains the container ID
