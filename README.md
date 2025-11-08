@@ -1,4 +1,4 @@
-# SDHM - Salty Docker Hosts Manager
+# SDHM - Saltbox Docker Hosts Manager
 
 A daemon that automatically updates `/etc/hosts` with Docker container hostnames from specified Docker networks.
 
