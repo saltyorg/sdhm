@@ -34,25 +34,7 @@ make build
 sudo make install
 ```
 
-### Option 2: Manual Build
-
-```bash
-# Clone the repository
-git clone https://github.com/saltyorg/sdhm.git
-cd sdhm
-
-# Download dependencies
-make deps
-
-# Build the binary
-make build
-
-# The binary will be in ./build/sdhm
-sudo cp build/sdhm /usr/local/bin/
-sudo chmod 755 /usr/local/bin/sdhm
-```
-
-### Option 3: Download Pre-built Binary
+### Option 2: Download Pre-built Binary
 
 Download the latest release from the [releases page](https://github.com/saltyorg/sdhm/releases), then:
 
