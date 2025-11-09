@@ -3,7 +3,6 @@ package updater
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/saltyorg/sdhm/internal/debounce"
 	"github.com/saltyorg/sdhm/internal/docker"
 	"github.com/saltyorg/sdhm/internal/hosts"
+	"github.com/saltyorg/sdhm/internal/logger"
 )
 
 const (
@@ -35,14 +35,14 @@ type Updater struct {
 	healthCheck  *HealthCheck
 	shutdownCh   chan struct{}
 	wg           sync.WaitGroup
-	logger       *log.Logger
+	logger       *logger.Logger
 	updateMutex  sync.Mutex    // Serializes all update operations
 	resetTimerCh chan struct{} // Signals periodic timer to reset
 }
 
 // NewUpdater creates a new Updater instance
-func NewUpdater(cfg *config.Config, logger *log.Logger) (*Updater, error) {
-	dockerClient, err := docker.NewDockerClient(cfg.DockerNetworks, logger.Printf)
+func NewUpdater(cfg *config.Config, log *logger.Logger) (*Updater, error) {
+	dockerClient, err := docker.NewDockerClient(cfg.DockerNetworks, log.LogFunc())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
 	}
@@ -61,7 +61,7 @@ func NewUpdater(cfg *config.Config, logger *log.Logger) (*Updater, error) {
 		config:       cfg,
 		healthCheck:  healthCheck,
 		shutdownCh:   make(chan struct{}),
-		logger:       logger,
+		logger:       log,
 		resetTimerCh: make(chan struct{}, 1), // Buffered to prevent blocking
 	}
 
@@ -76,7 +76,7 @@ func NewUpdater(cfg *config.Config, logger *log.Logger) (*Updater, error) {
 			updater.updateMutex.Unlock()
 
 			if err != nil {
-				logger.Printf("ERROR: Failed to update hosts file: %v", err)
+				log.Error("Failed to update hosts file: %v", err)
 			} else {
 				// Reset periodic timer after successful event-driven update
 				select {
@@ -99,13 +99,13 @@ func (u *Updater) Start(ctx context.Context) error {
 
 	// Fix non-breaking spaces
 	if err := u.hostsManager.FixNonBreakingSpaces(ctx); err != nil {
-		u.logger.Printf("WARN: Failed to fix non-breaking spaces: %v", err)
+		u.logger.Warn("Failed to fix non-breaking spaces: %v", err)
 	}
 
 	// Validate and recover hosts file if corrupted
 	if err := u.hostsManager.ValidateHostsFile(ctx, u.config.HostsFile); err != nil {
-		u.logger.Printf("WARN: Hosts file validation failed: %v", err)
-		if err := u.hostsManager.RecoverHostsFile(ctx, u.logger.Printf); err != nil {
+		u.logger.Warn("Hosts file validation failed: %v", err)
+		if err := u.hostsManager.RecoverHostsFile(ctx, u.logger.LogFunc()); err != nil {
 			return fmt.Errorf("failed to recover hosts file: %w", err)
 		}
 	}
@@ -117,7 +117,7 @@ func (u *Updater) Start(ctx context.Context) error {
 
 	// Do initial update
 	if err := u.updateHostsFile(ctx); err != nil {
-		u.logger.Printf("WARN: Initial update failed: %v", err)
+		u.logger.Warn("Initial update failed: %v", err)
 	}
 
 	// Create cancellable context
@@ -136,13 +136,13 @@ func (u *Updater) Start(ctx context.Context) error {
 	u.wg.Add(1)
 	go u.healthCheckServer(ctx)
 
-	u.logger.Printf("INFO: Updater started (periodic validation: %s)", u.config.PeriodicInterval)
+	u.logger.Info("Updater started (periodic validation: %s)", u.config.PeriodicInterval)
 
 	// Wait for shutdown signal
 	<-u.shutdownCh
 
 	// Graceful shutdown
-	u.logger.Println("INFO: Shutting down...")
+	u.logger.Info("Shutting down...")
 	cancel()
 	u.debouncer.Stop()
 	u.wg.Wait()
@@ -284,9 +284,9 @@ func (u *Updater) updateHostsFile(ctx context.Context) error {
 	}
 
 	if len(entries) > 0 {
-		u.logger.Printf("INFO: Hosts file updated successfully (%d container entries)", len(entries))
+		u.logger.Info("Hosts file updated successfully (%d container entries)", len(entries))
 	} else {
-		u.logger.Println("INFO: Hosts file updated successfully (no containers on network)")
+		u.logger.Info("Hosts file updated successfully (no containers on network)")
 	}
 
 	return nil
@@ -302,7 +302,7 @@ func (u *Updater) periodicUpdater(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			u.logger.Println("INFO: Periodic updater stopped")
+			u.logger.Info("Periodic updater stopped")
 			return
 
 		case <-u.resetTimerCh:
@@ -322,10 +322,10 @@ func (u *Updater) periodicUpdater(ctx context.Context) {
 			// Validate current state instead of unconditionally updating
 			inSync, details := u.validateHostsFile(ctx)
 			if !inSync {
-				u.logger.Printf("WARN: Hosts file out of sync: %s", details)
+				u.logger.Warn("Hosts file out of sync: %s", details)
 				u.healthCheck.RecordError("sync_check", details)
 				if err := u.updateHostsFile(ctx); err != nil {
-					u.logger.Printf("ERROR: Periodic update failed: %v", err)
+					u.logger.Error("Periodic update failed: %v", err)
 				}
 			}
 			// Silent when in sync - no log message needed
@@ -342,7 +342,7 @@ func (u *Updater) periodicUpdater(ctx context.Context) {
 func (u *Updater) eventMonitor(ctx context.Context) {
 	defer u.wg.Done()
 
-	u.logger.Println("INFO: Monitoring Docker network events (connect, disconnect)")
+	u.logger.Info("Monitoring Docker network events (connect, disconnect)")
 
 	backoff := EventStreamInitialBackoff
 	var eventCh <-chan events.Message
@@ -351,7 +351,7 @@ func (u *Updater) eventMonitor(ctx context.Context) {
 	for {
 		// Establish or re-establish connection to Docker event stream
 		if eventCh == nil {
-			u.logger.Println("INFO: Connecting to Docker event stream")
+			u.logger.Info("Connecting to Docker event stream")
 			eventCh, errCh = u.dockerClient.MonitorEvents(ctx)
 			// Reset backoff on successful connection
 			backoff = EventStreamInitialBackoff
@@ -359,20 +359,20 @@ func (u *Updater) eventMonitor(ctx context.Context) {
 
 		select {
 		case <-ctx.Done():
-			u.logger.Println("INFO: Event monitor stopped")
+			u.logger.Info("Event monitor stopped")
 			return
 
 		case err := <-errCh:
 			if err != nil {
 				u.healthCheck.RecordError("docker_events", fmt.Sprintf("event stream error: %v", err))
-				u.logger.Printf("ERROR: Docker event stream error: %v", err)
+				u.logger.Error("Docker event stream error: %v", err)
 
 				// Mark channels as dead so we reconnect on next iteration
 				eventCh = nil
 				errCh = nil
 
 				// Exponential backoff before reconnecting
-				u.logger.Printf("INFO: Reconnecting to Docker event stream in %v", backoff)
+				u.logger.Info("Reconnecting to Docker event stream in %v", backoff)
 
 				select {
 				case <-time.After(backoff):
@@ -382,7 +382,7 @@ func (u *Updater) eventMonitor(ctx context.Context) {
 						backoff = EventStreamMaxBackoff
 					}
 				case <-ctx.Done():
-					u.logger.Println("INFO: Event monitor stopped during reconnection backoff")
+					u.logger.Info("Event monitor stopped during reconnection backoff")
 					return
 				}
 			}
@@ -398,7 +398,7 @@ func (u *Updater) eventMonitor(ctx context.Context) {
 			if !u.dockerClient.IsMonitoredNetwork(networkName) {
 				// Log and ignore events from other networks
 				containerName := u.dockerClient.GetContainerName(ctx, containerID)
-				u.logger.Printf("INFO: Docker event: network %s on '%s' (container: %s) - not monitoring this network",
+				u.logger.Info("Docker event: network %s on '%s' (container: %s) - not monitoring this network",
 					event.Action, networkName, containerName)
 				continue
 			}
@@ -407,7 +407,7 @@ func (u *Updater) eventMonitor(ctx context.Context) {
 			containerName := u.dockerClient.GetContainerName(ctx, containerID)
 
 			// Log event with container and network information
-			u.logger.Printf("INFO: Docker event: network %s on '%s' (container: %s)",
+			u.logger.Info("Docker event: network %s on '%s' (container: %s)",
 				event.Action, networkName, containerName)
 			u.debouncer.Trigger()
 		}
@@ -427,9 +427,9 @@ func (u *Updater) healthCheckServer(ctx context.Context) {
 	}
 
 	go func() {
-		u.logger.Printf("INFO: Health check server started on %s:%d", u.config.HealthCheckAddr, u.config.HealthCheckPort)
+		u.logger.Info("Health check server started on %s:%d", u.config.HealthCheckAddr, u.config.HealthCheckPort)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			u.logger.Printf("ERROR: Health check server error: %v", err)
+			u.logger.Error("Health check server error: %v", err)
 			u.healthCheck.RecordError("healthcheck", fmt.Sprintf("server error: %v", err))
 		}
 	}()
@@ -440,6 +440,6 @@ func (u *Updater) healthCheckServer(ctx context.Context) {
 	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		u.logger.Printf("ERROR: Health check server shutdown error: %v", err)
+		u.logger.Error("Health check server shutdown error: %v", err)
 	}
 }

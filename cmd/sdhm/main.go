@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/saltyorg/sdhm/internal/config"
+	"github.com/saltyorg/sdhm/internal/logger"
 	"github.com/saltyorg/sdhm/internal/timeutil"
 	"github.com/saltyorg/sdhm/internal/updater"
 
@@ -64,11 +65,12 @@ func init() {
 }
 
 func run(cmd *cobra.Command, args []string) error {
-	logger := log.New(os.Stdout, "", log.LstdFlags)
+	stdLogger := log.New(os.Stdout, "", log.LstdFlags)
+	log := logger.New(stdLogger)
 
 	// Check if running as root
 	if os.Geteuid() != 0 {
-		logger.Println("WARN: This program should be run as root to modify /etc/hosts")
+		log.Warn("This program should be run as root to modify /etc/hosts")
 	}
 
 	// Parse interval
@@ -105,9 +107,9 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("at least one network must be specified")
 	}
 
-	logger.Printf("INFO: Starting sdhm")
-	logger.Printf("INFO: Monitoring networks: %v", filteredNetworks)
-	logger.Printf("INFO: Interval: %s, Health check: %s:%d", interval, healthCheckAddr, healthCheckPort)
+	log.Info("Starting sdhm")
+	log.Info("Monitoring networks: %v", filteredNetworks)
+	log.Info("Interval: %s, Health check: %s:%d", interval, healthCheckAddr, healthCheckPort)
 
 	// Create configuration
 	cfg := config.NewConfig(interval)
@@ -121,7 +123,7 @@ func run(cmd *cobra.Command, args []string) error {
 	cfg.MaxDebounceDelay = maxDebounceDelay
 
 	// Create updater
-	u, err := updater.NewUpdater(cfg, logger)
+	u, err := updater.NewUpdater(cfg, log)
 	if err != nil {
 		return fmt.Errorf("failed to create updater: %w", err)
 	}
@@ -134,7 +136,7 @@ func run(cmd *cobra.Command, args []string) error {
 	// Handle signals in separate goroutine
 	go func() {
 		<-ctx.Done()
-		logger.Println("INFO: Received shutdown signal")
+		log.Info("Received shutdown signal")
 		u.Shutdown()
 	}()
 
@@ -143,6 +145,6 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("updater failed: %w", err)
 	}
 
-	logger.Println("INFO: Shutdown complete")
+	log.Info("Shutdown complete")
 	return nil
 }
