@@ -3,8 +3,8 @@ module github.com/saltyorg/sdhm
 go 1.25.3
 
 require (
-	github.com/moby/moby/api v1.52.0-rc.1
-	github.com/moby/moby/client v0.1.0-rc.1
+	github.com/moby/moby/api v1.52.0
+	github.com/moby/moby/client v0.1.0
 	github.com/spf13/cobra v1.10.1
 )
 
@@ -28,5 +28,5 @@ require (
 	go.opentelemetry.io/otel v1.38.0 // indirect
 	go.opentelemetry.io/otel/metric v1.38.0 // indirect
 	go.opentelemetry.io/otel/trace v1.38.0 // indirect
-	golang.org/x/sys v0.37.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
 )

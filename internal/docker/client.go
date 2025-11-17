@@ -33,8 +33,8 @@ type DockerClient struct {
 // NewDockerClient creates a new Docker client
 // logFunc is optional (can be nil) and is used for logging warnings
 func NewDockerClient(networks []string, logFunc func(string, ...any)) (*DockerClient, error) {
-	cli, err := client.NewClientWithOpts(
-		client.FromEnv,
+	cli, err := client.New(
+		client.WithHost(client.DefaultDockerHost),
 		client.WithAPIVersionNegotiation(),
 	)
 	if err != nil {
