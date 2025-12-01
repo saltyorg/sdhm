@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/saltyorg/sdhm/internal/config"
+	"github.com/saltyorg/sdhm/internal/hosts"
 	"github.com/saltyorg/sdhm/internal/logger"
 	"github.com/saltyorg/sdhm/internal/timeutil"
 	"github.com/saltyorg/sdhm/internal/updater"
@@ -47,12 +48,29 @@ Features:
   - Updates /etc/hosts with debounced event handling
   - Periodic validation to ensure sync
   - Health check endpoint for monitoring
-  - Automatic recovery from corrupted hosts files`,
+
+Use 'sdhm regenerate' to reset a corrupted hosts file.`,
 	Version: version,
 	RunE:    run,
 }
 
+var regenerateCmd = &cobra.Command{
+	Use:   "regenerate",
+	Short: "Regenerate the hosts file with fresh content",
+	Long: `Regenerates the hosts file with Ubuntu Server defaults and an empty managed section.
+This is useful for resetting a corrupted hosts file.
+
+The generated file includes:
+  - Standard localhost entries (127.0.0.1, 127.0.1.1)
+  - IPv6 entries (ip6-localhost, ip6-loopback, etc.)
+  - Empty managed section markers for Docker containers`,
+	RunE: runRegenerate,
+}
+
 func init() {
+	rootCmd.AddCommand(regenerateCmd)
+	rootCmd.CompletionOptions.DisableDefaultCmd = true
+
 	rootCmd.Flags().StringVarP(&intervalStr, "interval", "i", "5m", "Periodic validation interval (e.g., 30s, 5m, 1h, 1d)")
 	rootCmd.Flags().IntVarP(&healthCheckPort, "health-port", "p", 8080, "Health check HTTP server port")
 	rootCmd.Flags().StringVar(&healthCheckAddr, "health-addr", "127.0.0.1", "IP address to bind health check server (e.g., 127.0.0.1, 0.0.0.0)")
@@ -62,6 +80,11 @@ func init() {
 	rootCmd.Flags().StringVar(&sectionName, "section-name", "DOCKER CONTAINERS", "Name for managed section in hosts file (markers auto-generated as '# BEGIN/END <name>')")
 	rootCmd.Flags().StringVar(&debounceDelayStr, "debounce-delay", "1s", "Debounce delay (e.g., 500ms, 1s, 2s)")
 	rootCmd.Flags().StringVar(&maxDebounceDelayStr, "debounce-max-delay", "5s", "Maximum debounce delay (e.g., 3s, 5s, 10s)")
+
+	// Flags for regenerate command (shared with root)
+	regenerateCmd.Flags().StringVar(&hostsFilePath, "hosts-file", "/etc/hosts", "Path to hosts file")
+	regenerateCmd.Flags().StringVar(&backupFilePath, "backup-file", "/etc/hosts.backup", "Path to backup file")
+	regenerateCmd.Flags().StringVar(&sectionName, "section-name", "DOCKER CONTAINERS", "Name for managed section in hosts file")
 }
 
 func run(cmd *cobra.Command, args []string) error {
@@ -146,5 +169,30 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	log.Info("Shutdown complete")
+	return nil
+}
+
+func runRegenerate(cmd *cobra.Command, args []string) error {
+	stdLogger := log.New(os.Stdout, "", log.LstdFlags)
+	l := logger.New(stdLogger)
+
+	// Check if running as root
+	if os.Geteuid() != 0 {
+		l.Warn("This program should be run as root to modify /etc/hosts")
+	}
+
+	l.Info("Regenerating hosts file...")
+
+	hostsManager := hosts.NewHostsFileManager(
+		hostsFilePath,
+		backupFilePath,
+		sectionName,
+	)
+
+	if err := hostsManager.GenerateFreshHostsFile(context.Background()); err != nil {
+		return fmt.Errorf("failed to regenerate hosts file: %w", err)
+	}
+
+	l.Info("Hosts file regenerated successfully at %s", hostsFilePath)
 	return nil
 }

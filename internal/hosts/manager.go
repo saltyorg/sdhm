@@ -60,38 +60,41 @@ func (m *HostsFileManager) RestoreBackup(ctx context.Context) error {
 	return nil
 }
 
-// ValidateHostsFile validates the structure of a hosts file
-func (m *HostsFileManager) ValidateHostsFile(ctx context.Context, filepath string) error {
+// ValidateWrittenContent verifies that a file contains the expected content after a write operation.
+// This is used to detect write failures or corruption.
+func (m *HostsFileManager) ValidateWrittenContent(ctx context.Context, filepath string, expectedContent string) error {
 	data, err := os.ReadFile(filepath)
 	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
+		return fmt.Errorf("failed to read file for validation: %w", err)
+	}
+
+	if string(data) != expectedContent {
+		return fmt.Errorf("file content does not match expected content (possible write failure)")
+	}
+
+	return nil
+}
+
+// EnsureMarkersValid checks that the managed section markers are in a valid state.
+// If no markers exist, they are added. If markers are corrupt (one missing or wrong order),
+// an error is returned and the user must run 'sdhm regenerate' to fix.
+func (m *HostsFileManager) EnsureMarkersValid(ctx context.Context) error {
+	data, err := os.ReadFile(m.hostsFile)
+	if err != nil {
+		return fmt.Errorf("failed to read hosts file: %w", err)
 	}
 
 	content := string(data)
 
-	// Check if file is empty
-	if strings.TrimSpace(content) == "" {
-		return fmt.Errorf("hosts file is empty")
-	}
-
-	// Check for localhost entries
-	hasLocalhost := strings.Contains(content, "127.0.0.1") || strings.Contains(content, "::1")
-	if !hasLocalhost {
-		return fmt.Errorf("missing required localhost entries")
-	}
-
-	// Check marker consistency
 	hasBegin := strings.Contains(content, m.beginMarker)
 	hasEnd := strings.Contains(content, m.endMarker)
 
-	if hasBegin && !hasEnd {
-		return fmt.Errorf("has BEGIN marker but no END marker")
+	// Neither marker exists - add them
+	if !hasBegin && !hasEnd {
+		return m.EnsureManagedSectionExists(ctx)
 	}
 
-	if !hasBegin && hasEnd {
-		return fmt.Errorf("has END marker but no BEGIN marker")
-	}
-
+	// Both exist - check order
 	if hasBegin && hasEnd {
 		beginIdx := strings.Index(content, m.beginMarker)
 		endIdx := strings.Index(content, m.endMarker)
@@ -99,9 +102,15 @@ func (m *HostsFileManager) ValidateHostsFile(ctx context.Context, filepath strin
 		if beginIdx > endIdx {
 			return fmt.Errorf("END marker appears before BEGIN marker")
 		}
+		return nil
 	}
 
-	return nil
+	// One marker missing - corrupt state
+	if hasBegin && !hasEnd {
+		return fmt.Errorf("has BEGIN marker but no END marker")
+	}
+
+	return fmt.Errorf("has END marker but no BEGIN marker")
 }
 
 // readSystemHostname reads the system hostname from /etc/hostname
@@ -163,11 +172,6 @@ func (m *HostsFileManager) GenerateFreshHostsFile(ctx context.Context) error {
 	}
 	tmpFile.Close()
 
-	// Validate the generated file
-	if err := m.ValidateHostsFile(ctx, tmpPath); err != nil {
-		return fmt.Errorf("generated file validation failed: %w", err)
-	}
-
 	// Replace hosts file
 	if err := os.Rename(tmpPath, m.hostsFile); err != nil {
 		return fmt.Errorf("failed to replace hosts file: %w", err)
@@ -178,44 +182,11 @@ func (m *HostsFileManager) GenerateFreshHostsFile(ctx context.Context) error {
 		return fmt.Errorf("failed to set permissions: %w", err)
 	}
 
-	return nil
-}
-
-// RecoverHostsFile attempts to recover a corrupted hosts file
-// First tries to restore from backup, then generates a fresh file if backup is invalid
-func (m *HostsFileManager) RecoverHostsFile(ctx context.Context, logFunc func(string, ...any)) error {
-	logFunc("INFO: Attempting hosts file recovery...")
-
-	// Try restoring from backup first
-	logFunc("INFO: Attempting to restore from backup...")
-	if err := m.RestoreBackup(ctx); err != nil {
-		logFunc("WARN: Backup restoration failed: %v", err)
-	} else {
-		// Validate restored backup
-		if err := m.ValidateHostsFile(ctx, m.hostsFile); err != nil {
-			logFunc("WARN: Restored backup validation failed: %v", err)
-		} else {
-			logFunc("INFO: Backup restored successfully")
-			logFunc("INFO: Hosts file recovery completed successfully")
-			return nil
-		}
+	// Validate the written file matches expected content
+	if err := m.ValidateWrittenContent(ctx, m.hostsFile, content.String()); err != nil {
+		return fmt.Errorf("write validation failed: %w", err)
 	}
 
-	// Backup failed or invalid, generate fresh hosts file
-	logFunc("INFO: Generating fresh hosts file...")
-
-	hostname, err := readSystemHostname()
-	if err != nil {
-		return fmt.Errorf("failed to get system hostname: %w", err)
-	}
-	logFunc("INFO: Using system hostname: %s", hostname)
-
-	if err := m.GenerateFreshHostsFile(ctx); err != nil {
-		return fmt.Errorf("failed to generate fresh hosts file: %w", err)
-	}
-
-	logFunc("INFO: Fresh hosts file generated successfully")
-	logFunc("INFO: Hosts file recovery completed successfully")
 	return nil
 }
 
@@ -412,11 +383,6 @@ func (m *HostsFileManager) UpdateManagedSection(ctx context.Context, entries []H
 	}
 	tmpFile.Close()
 
-	// Validate the new content
-	if err := m.ValidateHostsFile(ctx, tmpPath); err != nil {
-		return fmt.Errorf("validation failed: %w", err)
-	}
-
 	// Create backup
 	if err := m.CreateBackup(ctx); err != nil {
 		return fmt.Errorf("failed to create backup: %w", err)
@@ -430,6 +396,11 @@ func (m *HostsFileManager) UpdateManagedSection(ctx context.Context, entries []H
 	// Set proper permissions
 	if err := os.Chmod(m.hostsFile, 0644); err != nil {
 		return fmt.Errorf("failed to set permissions: %w", err)
+	}
+
+	// Validate the written file matches expected content
+	if err := m.ValidateWrittenContent(ctx, m.hostsFile, newContent); err != nil {
+		return fmt.Errorf("write validation failed: %w", err)
 	}
 
 	return nil

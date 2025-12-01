@@ -27,12 +27,55 @@ func createTempFile(t *testing.T, content string) string {
 	return tmpFile.Name()
 }
 
-func TestHostsFileManager_ValidateHostsFile(t *testing.T) {
+func TestHostsFileManager_ValidateWrittenContent(t *testing.T) {
+	tests := []struct {
+		name            string
+		fileContent     string
+		expectedContent string
+		wantErr         bool
+	}{
+		{
+			name:            "content matches",
+			fileContent:     "127.0.0.1 localhost\n",
+			expectedContent: "127.0.0.1 localhost\n",
+			wantErr:         false,
+		},
+		{
+			name:            "content does not match",
+			fileContent:     "127.0.0.1 localhost\n",
+			expectedContent: "127.0.0.1 different\n",
+			wantErr:         true,
+		},
+		{
+			name:            "empty file matches empty expected",
+			fileContent:     "",
+			expectedContent: "",
+			wantErr:         false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpFile := createTempFile(t, tt.fileContent)
+			defer os.Remove(tmpFile)
+
+			manager := NewHostsFileManager(tmpFile, tmpFile+".backup", "DOCKER CONTAINERS")
+			err := manager.ValidateWrittenContent(context.Background(), tmpFile, tt.expectedContent)
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateWrittenContent() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestHostsFileManager_EnsureMarkersValid(t *testing.T) {
 	tests := []struct {
 		name        string
 		content     string
 		wantErr     bool
 		errContains string
+		wantMarkers bool // expect markers to be added
 	}{
 		{
 			name: "valid hosts file with markers",
@@ -41,28 +84,16 @@ func TestHostsFileManager_ValidateHostsFile(t *testing.T) {
 # BEGIN DOCKER CONTAINERS
 # END DOCKER CONTAINERS
 `,
-			wantErr: false,
+			wantErr:     false,
+			wantMarkers: false,
 		},
 		{
-			name: "valid hosts file without markers",
+			name: "valid hosts file without markers - should add them",
 			content: `127.0.0.1 localhost
 ::1 localhost ip6-localhost
 `,
-			wantErr: false,
-		},
-		{
-			name:        "empty file",
-			content:     "",
-			wantErr:     true,
-			errContains: "empty",
-		},
-		{
-			name: "missing localhost",
-			content: `# BEGIN DOCKER CONTAINERS
-# END DOCKER CONTAINERS
-`,
-			wantErr:     true,
-			errContains: "localhost",
+			wantErr:     false,
+			wantMarkers: true,
 		},
 		{
 			name: "BEGIN marker without END",
@@ -93,20 +124,45 @@ func TestHostsFileManager_ValidateHostsFile(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tmpFile := createTempFile(t, tt.content)
-			defer os.Remove(tmpFile)
+			tmpDir, err := os.MkdirTemp("", "hosts_markers_test_*")
+			if err != nil {
+				t.Fatalf("Failed to create temp dir: %v", err)
+			}
+			defer os.RemoveAll(tmpDir)
 
-			manager := NewHostsFileManager(tmpFile, tmpFile+".backup", "DOCKER CONTAINERS")
-			err := manager.ValidateHostsFile(context.Background(), tmpFile)
+			hostsFile := filepath.Join(tmpDir, "hosts")
+			backupFile := filepath.Join(tmpDir, "hosts.backup")
+
+			if err := os.WriteFile(hostsFile, []byte(tt.content), 0644); err != nil {
+				t.Fatalf("Failed to create hosts file: %v", err)
+			}
+
+			manager := NewHostsFileManager(hostsFile, backupFile, "DOCKER CONTAINERS")
+			err = manager.EnsureMarkersValid(context.Background())
 
 			if (err != nil) != tt.wantErr {
-				t.Errorf("ValidateHostsFile() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("EnsureMarkersValid() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 
 			if err != nil && tt.errContains != "" {
 				if !strings.Contains(err.Error(), tt.errContains) {
 					t.Errorf("Expected error to contain %q, got %q", tt.errContains, err.Error())
+				}
+			}
+
+			if tt.wantMarkers && err == nil {
+				// Verify markers were added
+				data, err := os.ReadFile(hostsFile)
+				if err != nil {
+					t.Fatalf("Failed to read hosts file: %v", err)
+				}
+				content := string(data)
+				if !strings.Contains(content, "# BEGIN DOCKER CONTAINERS") {
+					t.Error("BEGIN marker not found after EnsureMarkersValid")
+				}
+				if !strings.Contains(content, "# END DOCKER CONTAINERS") {
+					t.Error("END marker not found after EnsureMarkersValid")
 				}
 			}
 		})

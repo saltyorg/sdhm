@@ -102,17 +102,9 @@ func (u *Updater) Start(ctx context.Context) error {
 		u.logger.Warn("Failed to fix non-breaking spaces: %v", err)
 	}
 
-	// Validate and recover hosts file if corrupted
-	if err := u.hostsManager.ValidateHostsFile(ctx, u.config.HostsFile); err != nil {
-		u.logger.Warn("Hosts file validation failed: %v", err)
-		if err := u.hostsManager.RecoverHostsFile(ctx, u.logger.LogFunc()); err != nil {
-			return fmt.Errorf("failed to recover hosts file: %w", err)
-		}
-	}
-
-	// Ensure managed section exists
-	if err := u.hostsManager.EnsureManagedSectionExists(ctx); err != nil {
-		return fmt.Errorf("failed to ensure managed section: %w", err)
+	// Ensure managed section markers are valid (adds them if missing, errors if corrupt)
+	if err := u.hostsManager.EnsureMarkersValid(ctx); err != nil {
+		return fmt.Errorf("hosts file markers invalid: %w (run 'sdhm regenerate' to fix)", err)
 	}
 
 	// Do initial update
