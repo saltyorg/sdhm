@@ -2,12 +2,78 @@ package hosts
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sort"
 	"strings"
+	"syscall"
 )
+
+// atomicMoveFile moves a file from src to dst, with fallback to copy for cross-filesystem moves.
+func atomicMoveFile(src, dst string) error {
+	err := os.Rename(src, dst)
+	if err == nil {
+		return nil
+	}
+
+	// Check for cross-device link error (EXDEV)
+	var linkErr *os.LinkError
+	if errors.As(err, &linkErr) && errors.Is(linkErr.Err, syscall.EXDEV) {
+		// Fallback to copy for cross-filesystem
+		if err := copyFile(src, dst); err != nil {
+			return fmt.Errorf("cross-filesystem copy failed: %w", err)
+		}
+		os.Remove(src) // Clean up source after successful copy
+		return nil
+	}
+
+	return fmt.Errorf("failed to move file: %w", err)
+}
+
+// copyFile copies a file from src to dst with proper permissions.
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open source: %w", err)
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("failed to create destination: %w", err)
+	}
+	defer dstFile.Close()
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return fmt.Errorf("failed to copy content: %w", err)
+	}
+
+	if err := dstFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync destination: %w", err)
+	}
+
+	return nil
+}
+
+// wrapDiskError wraps common disk errors with user-friendly messages.
+func wrapDiskError(err error, operation string) error {
+	if err == nil {
+		return nil
+	}
+
+	errStr := err.Error()
+	if strings.Contains(errStr, "no space left on device") {
+		return fmt.Errorf("%s: disk full", operation)
+	}
+	if strings.Contains(errStr, "read-only file system") {
+		return fmt.Errorf("%s: filesystem is read-only", operation)
+	}
+
+	return fmt.Errorf("%s: %w", operation, err)
+}
 
 // HostsFileManager manages the /etc/hosts file with safe operations
 type HostsFileManager struct {
@@ -161,25 +227,31 @@ func (m *HostsFileManager) GenerateFreshHostsFile(ctx context.Context) error {
 	// Write to temporary file first
 	tmpFile, err := os.CreateTemp("/tmp", "hosts_fresh_*")
 	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
+		return wrapDiskError(err, "failed to create temp file")
 	}
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 
 	if _, err := tmpFile.WriteString(content.String()); err != nil {
 		tmpFile.Close()
-		return fmt.Errorf("failed to write to temp file: %w", err)
+		return wrapDiskError(err, "failed to write to temp file")
+	}
+
+	// Sync to ensure data is on disk before moving
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		return wrapDiskError(err, "failed to sync temp file")
 	}
 	tmpFile.Close()
 
-	// Replace hosts file
-	if err := os.Rename(tmpPath, m.hostsFile); err != nil {
-		return fmt.Errorf("failed to replace hosts file: %w", err)
+	// Replace hosts file (handles cross-filesystem moves)
+	if err := atomicMoveFile(tmpPath, m.hostsFile); err != nil {
+		return wrapDiskError(err, "failed to replace hosts file")
 	}
 
 	// Set proper permissions
 	if err := os.Chmod(m.hostsFile, 0644); err != nil {
-		return fmt.Errorf("failed to set permissions: %w", err)
+		return wrapDiskError(err, "failed to set permissions")
 	}
 
 	// Validate the written file matches expected content
@@ -372,14 +444,20 @@ func (m *HostsFileManager) UpdateManagedSection(ctx context.Context, entries []H
 	// Create temporary file
 	tmpFile, err := os.CreateTemp("/tmp", "hosts_*")
 	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
+		return wrapDiskError(err, "failed to create temp file")
 	}
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 
 	if _, err := tmpFile.WriteString(newContent); err != nil {
 		tmpFile.Close()
-		return fmt.Errorf("failed to write to temp file: %w", err)
+		return wrapDiskError(err, "failed to write to temp file")
+	}
+
+	// Sync to ensure data is on disk before moving
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		return wrapDiskError(err, "failed to sync temp file")
 	}
 	tmpFile.Close()
 
@@ -388,14 +466,14 @@ func (m *HostsFileManager) UpdateManagedSection(ctx context.Context, entries []H
 		return fmt.Errorf("failed to create backup: %w", err)
 	}
 
-	// Atomic replace
-	if err := os.Rename(tmpPath, m.hostsFile); err != nil {
-		return fmt.Errorf("failed to replace hosts file: %w", err)
+	// Atomic replace (handles cross-filesystem moves)
+	if err := atomicMoveFile(tmpPath, m.hostsFile); err != nil {
+		return wrapDiskError(err, "failed to replace hosts file")
 	}
 
 	// Set proper permissions
 	if err := os.Chmod(m.hostsFile, 0644); err != nil {
-		return fmt.Errorf("failed to set permissions: %w", err)
+		return wrapDiskError(err, "failed to set permissions")
 	}
 
 	// Validate the written file matches expected content

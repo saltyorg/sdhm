@@ -4,7 +4,7 @@ go 1.25.3
 
 require (
 	github.com/moby/moby/api v1.52.0
-	github.com/moby/moby/client v0.1.0
+	github.com/moby/moby/client v0.2.1
 	github.com/spf13/cobra v1.10.1
 )
 
