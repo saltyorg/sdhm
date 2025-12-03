@@ -130,7 +130,7 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("at least one network must be specified")
 	}
 
-	log.Info("Starting sdhm")
+	log.Info("Starting sdhm %s", version)
 	log.Info("Monitoring networks: %v", filteredNetworks)
 	log.Info("Interval: %s, Health check: %s:%d", interval, healthCheckAddr, healthCheckPort)
 
