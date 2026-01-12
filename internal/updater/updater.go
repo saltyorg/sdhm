@@ -34,9 +34,12 @@ type Updater struct {
 	config       *config.Config
 	healthCheck  *HealthCheck
 	shutdownCh   chan struct{}
+	shutdownOnce sync.Once
 	wg           sync.WaitGroup
 	logger       *logger.Logger
-	updateMutex  sync.Mutex    // Serializes all update operations
+	updateMutex  sync.Mutex // Serializes all update operations
+	updateCtxMu  sync.RWMutex
+	updateCtx    context.Context
 	resetTimerCh chan struct{} // Signals periodic timer to reset
 }
 
@@ -62,6 +65,7 @@ func NewUpdater(cfg *config.Config, log *logger.Logger) (*Updater, error) {
 		healthCheck:  healthCheck,
 		shutdownCh:   make(chan struct{}),
 		logger:       log,
+		updateCtx:    context.Background(),
 		resetTimerCh: make(chan struct{}, 1), // Buffered to prevent blocking
 	}
 
@@ -72,7 +76,8 @@ func NewUpdater(cfg *config.Config, log *logger.Logger) (*Updater, error) {
 		func() {
 			// Lock to prevent concurrent updates
 			updater.updateMutex.Lock()
-			err := updater.updateHostsFile(context.Background())
+			updateCtx := updater.getUpdateContext()
+			err := updater.updateHostsFile(updateCtx)
 			updater.updateMutex.Unlock()
 
 			if err != nil {
@@ -115,6 +120,7 @@ func (u *Updater) Start(ctx context.Context) error {
 	// Create cancellable context
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	u.setUpdateContext(ctx)
 
 	// Start periodic updater goroutine
 	u.wg.Add(1)
@@ -130,8 +136,11 @@ func (u *Updater) Start(ctx context.Context) error {
 
 	u.logger.Info("Updater started (periodic validation: %s)", u.config.PeriodicInterval)
 
-	// Wait for shutdown signal
-	<-u.shutdownCh
+	// Wait for shutdown signal or context cancellation
+	select {
+	case <-u.shutdownCh:
+	case <-ctx.Done():
+	}
 
 	// Graceful shutdown
 	u.logger.Info("Shutting down...")
@@ -144,7 +153,24 @@ func (u *Updater) Start(ctx context.Context) error {
 
 // Shutdown signals the updater to stop
 func (u *Updater) Shutdown() {
-	close(u.shutdownCh)
+	u.shutdownOnce.Do(func() {
+		close(u.shutdownCh)
+	})
+}
+
+func (u *Updater) getUpdateContext() context.Context {
+	u.updateCtxMu.RLock()
+	defer u.updateCtxMu.RUnlock()
+	if u.updateCtx == nil {
+		return context.Background()
+	}
+	return u.updateCtx
+}
+
+func (u *Updater) setUpdateContext(ctx context.Context) {
+	u.updateCtxMu.Lock()
+	u.updateCtx = ctx
+	u.updateCtxMu.Unlock()
 }
 
 // Close closes resources
@@ -172,6 +198,18 @@ func hostnamesMatch(a, b []string) bool {
 	return true
 }
 
+func findHostnameIPChange(hostnames []string, lookup map[string]string, currentIP string) (string, string, bool) {
+	for _, hostname := range hostnames {
+		if hostname == "" {
+			continue
+		}
+		if ip, ok := lookup[hostname]; ok && ip != currentIP {
+			return ip, hostname, true
+		}
+	}
+	return "", "", false
+}
+
 // validateHostsFile checks if hosts file matches current Docker state
 func (u *Updater) validateHostsFile(ctx context.Context) (bool, string) {
 	// Create a context with timeout for Docker operations
@@ -196,9 +234,10 @@ func (u *Updater) validateHostsFile(ctx context.Context) (bool, string) {
 	for _, c := range containers {
 		ip := c.IP.String()
 		dockerMap[ip] = c.Hostnames
-		// Use first hostname as primary identifier
-		if len(c.Hostnames) > 0 {
-			dockerHostnameToIP[c.Hostnames[0]] = ip
+		for _, hostname := range c.Hostnames {
+			if hostname != "" {
+				dockerHostnameToIP[hostname] = ip
+			}
 		}
 	}
 
@@ -207,8 +246,10 @@ func (u *Updater) validateHostsFile(ctx context.Context) (bool, string) {
 	for _, entry := range currentEntries {
 		ip := entry.IP.String()
 		hostsMap[ip] = entry.Hostnames
-		if len(entry.Hostnames) > 0 {
-			hostsHostnameToIP[entry.Hostnames[0]] = ip
+		for _, hostname := range entry.Hostnames {
+			if hostname != "" {
+				hostsHostnameToIP[hostname] = ip
+			}
 		}
 	}
 
@@ -216,15 +257,24 @@ func (u *Updater) validateHostsFile(ctx context.Context) (bool, string) {
 	for ip, dockerHostnames := range dockerMap {
 		hostsHostnames, exists := hostsMap[ip]
 		if !exists {
-			containerName := dockerHostnames[0]
+			containerName := ip
+			if len(dockerHostnames) > 0 && dockerHostnames[0] != "" {
+				containerName = dockerHostnames[0]
+			}
 			// Check if this container exists with a different IP
-			if oldIP, hasOldIP := hostsHostnameToIP[containerName]; hasOldIP {
-				return false, fmt.Sprintf("container '%s' IP changed from %s to %s", containerName, oldIP, ip)
+			if oldIP, hostname, hasOldIP := findHostnameIPChange(dockerHostnames, hostsHostnameToIP, ip); hasOldIP {
+				if hostname == "" {
+					hostname = containerName
+				}
+				return false, fmt.Sprintf("container '%s' IP changed from %s to %s", hostname, oldIP, ip)
 			}
 			return false, fmt.Sprintf("container '%s' with IP %s missing from hosts file", containerName, ip)
 		}
 		if !hostnamesMatch(dockerHostnames, hostsHostnames) {
-			containerName := dockerHostnames[0]
+			containerName := ip
+			if len(dockerHostnames) > 0 && dockerHostnames[0] != "" {
+				containerName = dockerHostnames[0]
+			}
 			return false, fmt.Sprintf("hostname mismatch for container '%s' (IP %s): expected %v, found %v",
 				containerName, ip, dockerHostnames, hostsHostnames)
 		}
@@ -233,12 +283,18 @@ func (u *Updater) validateHostsFile(ctx context.Context) (bool, string) {
 	// Check for stale entries (in hosts file but not in Docker)
 	for ip, hostsHostnames := range hostsMap {
 		if _, exists := dockerMap[ip]; !exists {
-			staleHostname := hostsHostnames[0]
+			staleHostname := ip
+			if len(hostsHostnames) > 0 && hostsHostnames[0] != "" {
+				staleHostname = hostsHostnames[0]
+			}
 			// Check if this hostname exists with a different IP in Docker
-			if newIP, hasNewIP := dockerHostnameToIP[staleHostname]; hasNewIP {
+			if newIP, hostname, hasNewIP := findHostnameIPChange(hostsHostnames, dockerHostnameToIP, ip); hasNewIP {
+				if hostname == "" {
+					hostname = staleHostname
+				}
 				// This case is already covered by the IP change check above
 				// But handle it here for completeness
-				return false, fmt.Sprintf("container '%s' IP changed from %s to %s", staleHostname, ip, newIP)
+				return false, fmt.Sprintf("container '%s' IP changed from %s to %s", hostname, ip, newIP)
 			}
 			return false, fmt.Sprintf("stale entry '%s' with IP %s in hosts file (container no longer exists)", staleHostname, ip)
 		}
@@ -339,6 +395,22 @@ func (u *Updater) eventMonitor(ctx context.Context) {
 	backoff := EventStreamInitialBackoff
 	var eventCh <-chan events.Message
 	var errCh <-chan error
+	reconnect := func() bool {
+		u.logger.Info("Reconnecting to Docker event stream in %v", backoff)
+
+		select {
+		case <-time.After(backoff):
+			// Increase backoff for next potential failure
+			backoff *= EventStreamBackoffMultiplier
+			if backoff > EventStreamMaxBackoff {
+				backoff = EventStreamMaxBackoff
+			}
+			return true
+		case <-ctx.Done():
+			u.logger.Info("Event monitor stopped during reconnection backoff")
+			return false
+		}
+	}
 
 	for {
 		// Establish or re-establish connection to Docker event stream
@@ -354,7 +426,16 @@ func (u *Updater) eventMonitor(ctx context.Context) {
 			u.logger.Info("Event monitor stopped")
 			return
 
-		case err := <-errCh:
+		case err, ok := <-errCh:
+			if !ok {
+				u.logger.Warn("Docker event stream closed")
+				eventCh = nil
+				errCh = nil
+				if !reconnect() {
+					return
+				}
+				continue
+			}
 			if err != nil {
 				u.healthCheck.RecordError("docker_events", fmt.Sprintf("event stream error: %v", err))
 				u.logger.Error("Docker event stream error: %v", err)
@@ -364,22 +445,21 @@ func (u *Updater) eventMonitor(ctx context.Context) {
 				errCh = nil
 
 				// Exponential backoff before reconnecting
-				u.logger.Info("Reconnecting to Docker event stream in %v", backoff)
-
-				select {
-				case <-time.After(backoff):
-					// Increase backoff for next potential failure
-					backoff *= EventStreamBackoffMultiplier
-					if backoff > EventStreamMaxBackoff {
-						backoff = EventStreamMaxBackoff
-					}
-				case <-ctx.Done():
-					u.logger.Info("Event monitor stopped during reconnection backoff")
+				if !reconnect() {
 					return
 				}
 			}
 
-		case event := <-eventCh:
+		case event, ok := <-eventCh:
+			if !ok {
+				u.logger.Warn("Docker event stream closed")
+				eventCh = nil
+				errCh = nil
+				if !reconnect() {
+					return
+				}
+				continue
+			}
 			// All events are network events (connect/disconnect)
 			// The "container" attribute contains the container ID
 			// The "name" attribute contains the network name

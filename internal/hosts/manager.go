@@ -288,8 +288,44 @@ func (m *HostsFileManager) EnsureManagedSectionExists(ctx context.Context) error
 	content = strings.TrimRight(content, "\n")
 	content += fmt.Sprintf("\n%s\n%s\n", m.beginMarker, m.endMarker)
 
-	if err := os.WriteFile(m.hostsFile, []byte(content), 0644); err != nil {
-		return fmt.Errorf("failed to write hosts file: %w", err)
+	// Write to temporary file first
+	tmpFile, err := os.CreateTemp("/tmp", "hosts_*")
+	if err != nil {
+		return wrapDiskError(err, "failed to create temp file")
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmpFile.WriteString(content); err != nil {
+		tmpFile.Close()
+		return wrapDiskError(err, "failed to write to temp file")
+	}
+
+	// Sync to ensure data is on disk before moving
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		return wrapDiskError(err, "failed to sync temp file")
+	}
+	tmpFile.Close()
+
+	// Create backup
+	if err := m.CreateBackup(ctx); err != nil {
+		return fmt.Errorf("failed to create backup: %w", err)
+	}
+
+	// Atomic replace (handles cross-filesystem moves)
+	if err := atomicMoveFile(tmpPath, m.hostsFile); err != nil {
+		return wrapDiskError(err, "failed to replace hosts file")
+	}
+
+	// Set proper permissions
+	if err := os.Chmod(m.hostsFile, 0644); err != nil {
+		return wrapDiskError(err, "failed to set permissions")
+	}
+
+	// Validate the written file matches expected content
+	if err := m.ValidateWrittenContent(ctx, m.hostsFile, content); err != nil {
+		return fmt.Errorf("write validation failed: %w", err)
 	}
 
 	return nil
@@ -307,13 +343,44 @@ func (m *HostsFileManager) FixNonBreakingSpaces(ctx context.Context) error {
 
 	// Only write if there were changes
 	if content != fixedContent {
-		// Create backup first
+		// Write to temporary file first
+		tmpFile, err := os.CreateTemp("/tmp", "hosts_*")
+		if err != nil {
+			return wrapDiskError(err, "failed to create temp file")
+		}
+		tmpPath := tmpFile.Name()
+		defer os.Remove(tmpPath)
+
+		if _, err := tmpFile.WriteString(fixedContent); err != nil {
+			tmpFile.Close()
+			return wrapDiskError(err, "failed to write to temp file")
+		}
+
+		// Sync to ensure data is on disk before moving
+		if err := tmpFile.Sync(); err != nil {
+			tmpFile.Close()
+			return wrapDiskError(err, "failed to sync temp file")
+		}
+		tmpFile.Close()
+
+		// Create backup
 		if err := m.CreateBackup(ctx); err != nil {
 			return fmt.Errorf("failed to create backup: %w", err)
 		}
 
-		if err := os.WriteFile(m.hostsFile, []byte(fixedContent), 0644); err != nil {
-			return fmt.Errorf("failed to write hosts file: %w", err)
+		// Atomic replace (handles cross-filesystem moves)
+		if err := atomicMoveFile(tmpPath, m.hostsFile); err != nil {
+			return wrapDiskError(err, "failed to replace hosts file")
+		}
+
+		// Set proper permissions
+		if err := os.Chmod(m.hostsFile, 0644); err != nil {
+			return wrapDiskError(err, "failed to set permissions")
+		}
+
+		// Validate the written file matches expected content
+		if err := m.ValidateWrittenContent(ctx, m.hostsFile, fixedContent); err != nil {
+			return fmt.Errorf("write validation failed: %w", err)
 		}
 	}
 

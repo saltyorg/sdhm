@@ -97,13 +97,16 @@ func (d *DockerClient) ListContainersOnNetwork(ctx context.Context) ([]Container
 				continue
 			}
 
-			// Skip if no IP address
-			if !networkSettings.IPAddress.IsValid() {
+			ipAddr := networkSettings.IPAddress
+			if !ipAddr.IsValid() {
+				ipAddr = networkSettings.GlobalIPv6Address
+			}
+			if !ipAddr.IsValid() {
 				continue
 			}
 
 			// Convert netip.Addr to net.IP
-			ip := net.IP(networkSettings.IPAddress.AsSlice())
+			ip := net.IP(ipAddr.AsSlice())
 
 			// Get aliases (hostnames)
 			aliases := networkSettings.Aliases
@@ -191,6 +194,7 @@ func (d *DockerClient) MonitorEvents(ctx context.Context) (<-chan events.Message
 	// Container lifecycle events (start/stop/die/destroy) are redundant - network events
 	// fire first and provide complete coverage of all network connectivity changes.
 	eventFilters := client.Filters{}.
+		Add("type", "network").
 		Add("event", "connect").   // Container joins a network
 		Add("event", "disconnect") // Container leaves a network
 

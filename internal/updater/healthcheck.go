@@ -153,19 +153,21 @@ type ErrorWithRecovery struct {
 // ServeHTTP implements http.Handler interface
 func (h *HealthCheck) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
+	errors := make([]ErrorRecord, len(h.errors))
+	copy(errors, h.errors)
+	h.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 
 	now := time.Now()
 
 	// Build error list with recovery information
-	errorsWithRecovery := make([]ErrorWithRecovery, 0, len(h.errors))
+	errorsWithRecovery := make([]ErrorWithRecovery, 0, len(errors))
 	var maxTimeUntilHealthy time.Duration
 	var criticalError *ErrorRecord
 
-	for i := range h.errors {
-		err := &h.errors[i]
+	for i := range errors {
+		err := &errors[i]
 		recoveryPeriod := getRecoveryPeriod(err.Severity)
 		timeSinceError := now.Sub(err.Timestamp)
 		timeUntilRecovered := max(recoveryPeriod-timeSinceError, 0)
@@ -187,14 +189,14 @@ func (h *HealthCheck) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	response := map[string]any{
 		"healthy":     healthy,
-		"error_count": len(h.errors),
+		"error_count": len(errors),
 		"errors":      errorsWithRecovery,
 	}
 
 	if healthy {
 		w.WriteHeader(http.StatusOK)
 		response["status"] = "ok"
-		if len(h.errors) == 0 {
+		if len(errors) == 0 {
 			response["message"] = "No errors recorded"
 		} else {
 			response["message"] = "All errors have exceeded their recovery period"

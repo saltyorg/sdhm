@@ -16,7 +16,7 @@ A daemon that automatically updates `/etc/hosts` with Docker container hostnames
 
 - Linux system with Docker installed
 - Root access (to modify `/etc/hosts`)
-- Go 1.25.3+ (for building from source)
+- Go 1.25.5+ (for building from source)
 
 ## Installation
 
