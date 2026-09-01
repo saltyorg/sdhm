@@ -8,7 +8,10 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/saltyorg/sdhm/daemon"
 )
@@ -17,12 +20,14 @@ type faultOps struct {
 	base            fileOps
 	failAt          map[string]int
 	calls           map[string]int
+	callOrder       []string
 	failErr         map[string]error
 	tempDirs        []string
 	tempPaths       []string
 	openDirs        []string
 	readbackPending bool
 	readbackBytes   []byte
+	afterRename     func(string, string)
 }
 
 func newFaultOps() *faultOps {
@@ -50,6 +55,7 @@ func newFaultOps() *faultOps {
 }
 
 func (o *faultOps) fault(operation string) error {
+	o.callOrder = append(o.callOrder, operation)
 	o.calls[operation]++
 	if o.failAt[operation] == o.calls[operation] {
 		return o.failErr[operation]
@@ -104,6 +110,9 @@ func (o *faultOps) Rename(oldPath, newPath string) error {
 		return err
 	}
 	o.readbackPending = true
+	if o.afterRename != nil {
+		o.afterRename(oldPath, newPath)
+	}
 	return nil
 }
 
@@ -229,6 +238,22 @@ func TestFileOpsFaultsReadOnConfiguredCall(t *testing.T) {
 	}
 }
 
+func TestMetadataFromInfoPreservesOwnershipAndApplicableModeBits(t *testing.T) {
+	wantMode := fs.FileMode(0o640) | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky
+	info := staticFileInfo{
+		mode: wantMode,
+		stat: &syscall.Stat_t{Uid: 123, Gid: 456},
+	}
+
+	got := metadataFromInfo(info)
+	if got.mode != wantMode {
+		t.Errorf("metadata mode = %v, want %v", got.mode, wantMode)
+	}
+	if got.uid != 123 || got.gid != 456 || !got.setOwnership {
+		t.Errorf("metadata ownership = (%d, %d, %v), want (123, 456, true)", got.uid, got.gid, got.setOwnership)
+	}
+}
+
 func TestReplaceFileSuccess(t *testing.T) {
 	target, metadata := createTarget(t, "old\n", 0o640)
 	ops := newFaultOps()
@@ -279,6 +304,42 @@ func TestReplaceFileSuccess(t *testing.T) {
 	if got := ops.calls["remove"]; got != 0 {
 		t.Errorf("remove calls = %d, want 0 after rename", got)
 	}
+	wantOrder := []string{
+		"create_temp",
+		"chown",
+		"write",
+		"chmod",
+		"file_sync",
+		"file_close",
+		"rename",
+		"open_dir",
+		"dir_sync",
+		"dir_close",
+		"readback",
+	}
+	if !slices.Equal(ops.callOrder, wantOrder) {
+		t.Errorf("file operation order = %q, want %q", ops.callOrder, wantOrder)
+	}
+}
+
+func TestReplaceFilePreservesSpecialModeBitsOnOwnedFile(t *testing.T) {
+	target, _ := createTarget(t, "old\n", 0o640)
+	wantMode := fs.FileMode(0o640) | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky
+	if err := os.Chmod(target, wantMode); err != nil {
+		t.Fatalf("set target mode: %v", err)
+	}
+	info, err := os.Lstat(target)
+	if err != nil {
+		t.Fatalf("lstat target before replacement: %v", err)
+	}
+	metadata := metadataFromInfo(info)
+	store := newStore(newFaultOps())
+
+	if _, err := store.replaceFile(t.Context(), target, []byte("new\n"), metadata); err != nil {
+		t.Fatalf("replaceFile() error = %v", err)
+	}
+	assertFileContent(t, target, []byte("new\n"))
+	assertFileModeBits(t, target, wantMode)
 }
 
 func TestReplaceFilePreRenameFailuresLeaveTargetUnchanged(t *testing.T) {
@@ -836,6 +897,36 @@ func TestStoreApplyLateTargetFailureRollsBackOnlyTarget(t *testing.T) {
 	}
 }
 
+func TestStoreApplyCancellationAfterTargetRenameStillRollsBack(t *testing.T) {
+	old := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n10.0.0.1 old old.saltbox\n# END DOCKER CONTAINERS\n")
+	target, backup := createStoreFiles(t, old, []byte("backup sentinel\n"))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ops := newFaultOps()
+	ops.afterRename = func(_, newPath string) {
+		if newPath == target && ops.calls["rename"] == 2 {
+			cancel()
+		}
+	}
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+	store.ops = ops
+	endpoints := []daemon.Endpoint{{
+		Network: "saltbox",
+		IP:      netip.MustParseAddr("172.18.0.2"),
+		Aliases: []string{"radarr"},
+	}}
+
+	err := store.Apply(ctx, endpoints)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Apply() error = %v, want context.Canceled", err)
+	}
+	assertFileContent(t, target, old)
+	assertFileContent(t, backup, old)
+	if got := ops.calls["rename"]; got != 3 {
+		t.Fatalf("rename calls = %d, want backup, target, and detached-context rollback", got)
+	}
+}
+
 func TestStoreApplyJoinsPrimaryAndRollbackFailures(t *testing.T) {
 	old := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n10.0.0.1 old old.saltbox\n# END DOCKER CONTAINERS\n")
 	target, backup := createStoreFiles(t, old, []byte("backup sentinel\n"))
@@ -897,6 +988,47 @@ func TestStoreRegenerateBacksUpValidPriorTarget(t *testing.T) {
 	assertFileContent(t, backup, prior)
 }
 
+func TestStoreRegenerateCreatesMissingBackupWithDefaultMetadata(t *testing.T) {
+	const validPrior = "127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.2 old old.saltbox\n# END DOCKER CONTAINERS\n"
+
+	tests := []struct {
+		name       string
+		prior      []byte
+		wantBackup []byte
+	}{
+		{
+			name:       "valid target becomes backup",
+			prior:      []byte(validPrior),
+			wantBackup: []byte(validPrior),
+		},
+		{
+			name:       "corrupt target is never copied to backup",
+			prior:      []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n"),
+			wantBackup: freshHostsFixture(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target, backup := createStoreFiles(t, tt.prior, nil)
+			if err := os.Chmod(target, 0o600); err != nil {
+				t.Fatalf("chmod target: %v", err)
+			}
+			store := NewStore(target, backup, "DOCKER CONTAINERS", "")
+			store.hostname = func() (string, error) { return "saltbox-host", nil }
+
+			if err := store.Regenerate(t.Context()); err != nil {
+				t.Fatalf("Regenerate() error = %v", err)
+			}
+			assertFileContent(t, target, freshHostsFixture())
+			assertFileMode(t, target, 0o600)
+			assertFileContent(t, backup, tt.wantBackup)
+			assertFileMode(t, backup, 0o644)
+			assertFileOwnership(t, backup, os.Getuid(), os.Getgid())
+		})
+	}
+}
+
 func TestStoreRegeneratePreservesValidBackupWhenPriorTargetIsCorrupt(t *testing.T) {
 	corrupt := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n")
 	validBackup := []byte("127.0.0.1 recovery\n# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n")
@@ -936,6 +1068,7 @@ func TestStoreRegenerateRepairsInvalidBackupAfterCorruptTarget(t *testing.T) {
 	assertFileContent(t, backup, want)
 	assertFileMode(t, target, 0o640)
 	assertFileMode(t, backup, 0o600)
+	assertFileOwnership(t, backup, os.Getuid(), os.Getgid())
 }
 
 func TestStoreRegenerateHostnameFailureDoesNotMutateFiles(t *testing.T) {
@@ -998,6 +1131,48 @@ func assertFileMode(t *testing.T, path string, want fs.FileMode) {
 		t.Fatalf("mode of %s = %04o, want %04o", path, got, want)
 	}
 }
+
+func assertFileOwnership(t *testing.T, path string, wantUID, wantGID int) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", path, err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("stat metadata for %s has type %T, want *syscall.Stat_t", path, info.Sys())
+	}
+	if got := int(stat.Uid); got != wantUID {
+		t.Errorf("uid of %s = %d, want %d", path, got, wantUID)
+	}
+	if got := int(stat.Gid); got != wantGID {
+		t.Errorf("gid of %s = %d, want %d", path, got, wantGID)
+	}
+}
+
+func assertFileModeBits(t *testing.T, path string, want fs.FileMode) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", path, err)
+	}
+	mask := fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky
+	if got := info.Mode() & mask; got != want {
+		t.Fatalf("mode bits of %s = %v, want %v", path, got, want)
+	}
+}
+
+type staticFileInfo struct {
+	mode fs.FileMode
+	stat *syscall.Stat_t
+}
+
+func (i staticFileInfo) Name() string       { return "hosts" }
+func (i staticFileInfo) Size() int64        { return 0 }
+func (i staticFileInfo) Mode() fs.FileMode  { return i.mode }
+func (i staticFileInfo) ModTime() time.Time { return time.Time{} }
+func (i staticFileInfo) IsDir() bool        { return false }
+func (i staticFileInfo) Sys() any           { return i.stat }
 
 func createTarget(t *testing.T, content string, mode fs.FileMode) (string, fileMetadata) {
 	t.Helper()

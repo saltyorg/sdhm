@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/saltyorg/sdhm/daemon"
 )
@@ -20,6 +21,8 @@ type fileMetadata struct {
 	gid          int
 	setOwnership bool
 }
+
+const rollbackTimeout = 5 * time.Second
 
 type Store struct {
 	ops            fileOps
@@ -116,7 +119,7 @@ func (s *Store) Apply(ctx context.Context, endpoints []daemon.Endpoint) error {
 		return nil
 	}
 
-	return s.applyReplacement(ctx, current, proposed, metadata)
+	return s.applyReplacement(ctx, current, proposed, metadata, metadata)
 }
 
 // Regenerate replaces the hosts file with Ubuntu-compatible baseline content.
@@ -147,7 +150,7 @@ func (s *Store) Regenerate(ctx context.Context) error {
 	}
 	if targetExists {
 		if err := requireValidMarkers(current, s.beginMarker, s.endMarker); err == nil {
-			return s.applyReplacement(ctx, current, fresh, targetMetadata)
+			return s.applyReplacement(ctx, current, fresh, targetMetadata, defaultFileMetadata())
 		}
 	}
 
@@ -159,7 +162,7 @@ func (s *Store) Regenerate(ctx context.Context) error {
 	if backupExists {
 		backupValid = requireValidMarkers(backup, s.beginMarker, s.endMarker) == nil
 	} else {
-		backupMetadata = targetMetadata
+		backupMetadata = defaultFileMetadata()
 	}
 	if !backupValid {
 		if _, err := s.replaceFile(ctx, s.backupPath, fresh, backupMetadata); err != nil {
@@ -176,13 +179,13 @@ func (s *Store) Regenerate(ctx context.Context) error {
 // applyReplacement refreshes the backup from caller-validated current bytes,
 // installs caller-validated proposed bytes, and restores only the target after
 // a failure that occurs after the target rename.
-func (s *Store) applyReplacement(ctx context.Context, current, proposed []byte, targetMetadata fileMetadata) error {
+func (s *Store) applyReplacement(ctx context.Context, current, proposed []byte, targetMetadata, newBackupMetadata fileMetadata) error {
 	_, backupMetadata, exists, err := s.readOptionalRegularFile(s.backupPath)
 	if err != nil {
 		return fmt.Errorf("inspect backup: %w", err)
 	}
 	if !exists {
-		backupMetadata = targetMetadata
+		backupMetadata = newBackupMetadata
 	}
 
 	if _, err := s.replaceFile(ctx, s.backupPath, current, backupMetadata); err != nil {
@@ -197,7 +200,7 @@ func (s *Store) applyReplacement(ctx context.Context, current, proposed []byte, 
 	if !renamed {
 		return primaryErr
 	}
-	rollbackErr := s.restoreTarget(ctx, s.hostsPath, current, targetMetadata)
+	rollbackErr := s.rollbackTarget(ctx, s.hostsPath, current, targetMetadata)
 	return errors.Join(primaryErr, rollbackErr)
 }
 
@@ -240,8 +243,14 @@ func (s *Store) initializeManagedSection(ctx context.Context, current, proposed 
 	if !renamed {
 		return primaryErr
 	}
-	rollbackErr := s.restoreTarget(ctx, s.hostsPath, current, targetMetadata)
+	rollbackErr := s.rollbackTarget(ctx, s.hostsPath, current, targetMetadata)
 	return errors.Join(primaryErr, rollbackErr)
+}
+
+func (s *Store) rollbackTarget(ctx context.Context, target string, retainedValidatedBytes []byte, metadata fileMetadata) error {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+	defer cancel()
+	return s.restoreTarget(rollbackCtx, target, retainedValidatedBytes, metadata)
 }
 
 func (s *Store) readRegularFile(path string) ([]byte, fileMetadata, error) {
@@ -275,7 +284,8 @@ func (s *Store) readOptionalRegularFile(path string) ([]byte, fileMetadata, bool
 }
 
 func metadataFromInfo(info fs.FileInfo) fileMetadata {
-	metadata := fileMetadata{mode: info.Mode().Perm()}
+	modeMask := fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky
+	metadata := fileMetadata{mode: info.Mode() & modeMask}
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 		metadata.uid = int(stat.Uid)
 		metadata.gid = int(stat.Gid)
@@ -358,13 +368,6 @@ func (s *Store) replaceFile(ctx context.Context, target string, data []byte, met
 		return joined
 	}
 
-	if err := checkContext(ctx, "set temporary file mode"); err != nil {
-		return false, cleanup(err)
-	}
-	if err := temp.Chmod(metadata.mode); err != nil {
-		return false, cleanup(fmt.Errorf("set temporary file mode: %w", err))
-	}
-
 	if metadata.setOwnership {
 		if err := checkContext(ctx, "set temporary file ownership"); err != nil {
 			return false, cleanup(err)
@@ -383,6 +386,13 @@ func (s *Store) replaceFile(ctx context.Context, target string, data []byte, met
 	}
 	if written != len(data) {
 		return false, cleanup(fmt.Errorf("write temporary file: %w", io.ErrShortWrite))
+	}
+
+	if err := checkContext(ctx, "set final temporary file mode"); err != nil {
+		return false, cleanup(err)
+	}
+	if err := temp.Chmod(metadata.mode); err != nil {
+		return false, cleanup(fmt.Errorf("set final temporary file mode: %w", err))
 	}
 
 	if err := checkContext(ctx, "sync temporary file"); err != nil {
