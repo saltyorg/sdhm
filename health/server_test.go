@@ -84,6 +84,22 @@ func TestServerShutdownIsIdempotent(t *testing.T) {
 	assertDone(t, server.Done())
 }
 
+func TestServerCompletedShutdownPrecedesCanceledContext(t *testing.T) {
+	server := startTestServer(t)
+
+	if err := server.Shutdown(t.Context()); err != nil {
+		t.Fatalf("initial Shutdown() error = %v", err)
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for range 100 {
+		if err := server.Shutdown(canceledCtx); err != nil {
+			t.Fatalf("Shutdown() after completion with canceled context error = %v, want nil", err)
+		}
+	}
+}
+
 func TestServerTimeouts(t *testing.T) {
 	server := NewServer("127.0.0.1:0", http.NotFoundHandler())
 

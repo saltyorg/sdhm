@@ -91,7 +91,18 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	select {
 	case <-s.done:
 		return s.shutdownErr
+	default:
+	}
+
+	select {
+	case <-s.done:
+		return s.shutdownErr
 	case <-ctx.Done():
+		select {
+		case <-s.done:
+			return s.shutdownErr
+		default:
+		}
 		if s.shutdownErr != nil {
 			return s.shutdownErr
 		}
