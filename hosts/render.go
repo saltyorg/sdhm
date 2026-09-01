@@ -15,6 +15,7 @@ import (
 type renderedEndpoint struct {
 	network   string
 	ip        netip.Addr
+	ipText    string
 	hostnames []string
 }
 
@@ -36,6 +37,7 @@ func renderEndpoints(endpoints []daemon.Endpoint, defaultNetwork string) ([]byte
 	}
 
 	rendered := make([]renderedEndpoint, len(cloned))
+	maxIPWidth := 0
 	for i, endpoint := range cloned {
 		hostnames := make(map[string]struct{}, len(endpoint.Aliases)*2)
 		for _, alias := range endpoint.Aliases {
@@ -48,8 +50,10 @@ func renderEndpoints(endpoints []daemon.Endpoint, defaultNetwork string) ([]byte
 		rendered[i] = renderedEndpoint{
 			network:   endpoint.Network,
 			ip:        endpoint.IP,
+			ipText:    endpoint.IP.String(),
 			hostnames: slices.Sorted(maps.Keys(hostnames)),
 		}
+		maxIPWidth = max(maxIPWidth, len(rendered[i].ipText))
 	}
 
 	slices.SortFunc(rendered, func(left, right renderedEndpoint) int {
@@ -62,7 +66,7 @@ func renderEndpoints(endpoints []daemon.Endpoint, defaultNetwork string) ([]byte
 
 	var body strings.Builder
 	for _, endpoint := range rendered {
-		fmt.Fprintf(&body, "%s %s\n", endpoint.ip, strings.Join(endpoint.hostnames, " "))
+		fmt.Fprintf(&body, "%-*s %s\n", maxIPWidth, endpoint.ipText, strings.Join(endpoint.hostnames, " "))
 	}
 	return []byte(body.String()), nil
 }

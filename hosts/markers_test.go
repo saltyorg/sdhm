@@ -78,27 +78,48 @@ func TestLocateMarkers(t *testing.T) {
 }
 
 func TestReplaceManagedSectionPreservesOutsideBytes(t *testing.T) {
-	input := []byte("prefix\r\n# BEGIN DOCKER CONTAINERS\r\nold entry\r\n# END DOCKER CONTAINERS\r\nsuffix\n")
-	state, section, err := locateMarkers(input, testBeginMarker, testEndMarker)
-	if err != nil {
-		t.Fatalf("locateMarkers() error = %v", err)
-	}
-	if state != validMarkers {
-		t.Fatalf("locateMarkers() state = %v, want %v", state, validMarkers)
+	tests := []struct {
+		name   string
+		suffix []byte
+	}{
+		{
+			name:   "suffix without a final newline",
+			suffix: []byte("# END DOCKER CONTAINERS"),
+		},
+		{
+			name:   "suffix with multiple final newlines",
+			suffix: []byte("# END DOCKER CONTAINERS\n\n\n"),
+		},
+		{
+			name:   "suffix with trailing content",
+			suffix: []byte("# END DOCKER CONTAINERS\n# user-owned content\n"),
+		},
 	}
 
-	got := replaceManagedSection(input, section, []byte("172.18.0.2 radarr radarr.saltbox\n"))
-	want := []byte("prefix\r\n# BEGIN DOCKER CONTAINERS\r\n172.18.0.2 radarr radarr.saltbox\n# END DOCKER CONTAINERS\r\nsuffix\n")
-	if !bytes.Equal(got, want) {
-		t.Fatalf("replaceManagedSection() = %q, want %q", got, want)
-	}
-	if !bytes.Equal(got[:section.beginEnd], input[:section.beginEnd]) {
-		t.Fatal("bytes before the managed section changed")
-	}
-	if !bytes.Equal(got[len(got)-len(input[section.endStart:]):], input[section.endStart:]) {
-		t.Fatal("bytes from END marker onward changed")
-	}
-	if !bytes.Equal(bytes.TrimRight(got, "\n"), got[:len(got)-1]) {
-		t.Fatal("result does not have exactly one trailing newline")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prefix := []byte("prefix\r\n# BEGIN DOCKER CONTAINERS\r\n")
+			input := append(append(append([]byte{}, prefix...), []byte("old entry\r\n")...), tt.suffix...)
+			state, section, err := locateMarkers(input, testBeginMarker, testEndMarker)
+			if err != nil {
+				t.Fatalf("locateMarkers() error = %v", err)
+			}
+			if state != validMarkers {
+				t.Fatalf("locateMarkers() state = %v, want %v", state, validMarkers)
+			}
+
+			body := []byte("172.18.0.2 radarr radarr.saltbox\n")
+			got := replaceManagedSection(input, section, body)
+			want := append(append(append([]byte{}, prefix...), body...), tt.suffix...)
+			if !bytes.Equal(got, want) {
+				t.Fatalf("replaceManagedSection() = %q, want %q", got, want)
+			}
+			if !bytes.Equal(got[:section.beginEnd], input[:section.beginEnd]) {
+				t.Fatal("bytes before the managed section changed")
+			}
+			if !bytes.Equal(got[len(got)-len(tt.suffix):], tt.suffix) {
+				t.Fatal("bytes from END marker onward changed")
+			}
+		})
 	}
 }

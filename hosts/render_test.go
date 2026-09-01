@@ -32,7 +32,31 @@ func TestRenderEndpointsUsesDefaultNetworkForBareAliases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("renderEndpoints() error = %v", err)
 	}
-	want := []byte("2001:db8::2 bazarr bazarr.saltbox\n172.18.0.2 radarr radarr.saltbox\n172.20.0.2 radarr.backend\n")
+	want := []byte("2001:db8::2 bazarr bazarr.saltbox\n172.18.0.2  radarr radarr.saltbox\n172.20.0.2  radarr.backend\n")
+	if !bytes.Equal(got, want) {
+		t.Fatalf("renderEndpoints() = %q, want %q", got, want)
+	}
+}
+
+func TestRenderEndpointsAlignsMixedIPColumns(t *testing.T) {
+	endpoints := []daemon.Endpoint{
+		{
+			Network: "saltbox",
+			IP:      netip.MustParseAddr("172.18.0.2"),
+			Aliases: []string{"radarr"},
+		},
+		{
+			Network: "saltbox",
+			IP:      netip.MustParseAddr("2001:db8::2"),
+			Aliases: []string{"bazarr"},
+		},
+	}
+
+	got, err := renderEndpoints(endpoints, "saltbox")
+	if err != nil {
+		t.Fatalf("renderEndpoints() error = %v", err)
+	}
+	want := []byte("2001:db8::2 bazarr bazarr.saltbox\n172.18.0.2  radarr radarr.saltbox\n")
 	if !bytes.Equal(got, want) {
 		t.Fatalf("renderEndpoints() = %q, want %q", got, want)
 	}
