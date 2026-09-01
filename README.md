@@ -143,7 +143,7 @@ Create `/etc/systemd/system/sdhm.service`:
 [Unit]
 Description=Saltbox Docker Hosts Manager
 After=docker.service
-Requires=docker.service
+BindsTo=docker.service
 
 [Service]
 Type=simple
@@ -152,8 +152,10 @@ Restart=always
 RestartSec=10
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=docker.service
 ```
+
+This binding stops SDHM during Docker teardown before authoritative transitional snapshots can rewrite the last converged hosts state.
 
 Enable and start the service:
 
