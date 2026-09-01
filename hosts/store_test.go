@@ -17,6 +17,7 @@ type faultOps struct {
 	failErr         map[string]error
 	tempDirs        []string
 	tempPaths       []string
+	openDirs        []string
 	readbackPending bool
 	readbackBytes   []byte
 }
@@ -111,6 +112,7 @@ func (o *faultOps) Remove(path string) error {
 }
 
 func (o *faultOps) OpenDir(path string) (syncDir, error) {
+	o.openDirs = append(o.openDirs, path)
 	if err := o.fault("open_dir"); err != nil {
 		return nil, err
 	}
@@ -176,6 +178,54 @@ func (d *faultDir) Close() error {
 	return errors.Join(faultErr, d.syncDir.Close())
 }
 
+func TestFileOpsFaultsLstatOnConfiguredCall(t *testing.T) {
+	target, _ := createTarget(t, "old\n", 0o640)
+	ops := newFaultOps()
+	ops.failAt["lstat"] = 2
+
+	info, err := ops.Lstat(target)
+	if err != nil {
+		t.Fatalf("first Lstat() error = %v", err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("first Lstat() mode = %v, want regular file", info.Mode())
+	}
+	if _, err := ops.Lstat(target); !errors.Is(err, ops.failErr["lstat"]) {
+		t.Fatalf("second Lstat() error = %v, want %v", err, ops.failErr["lstat"])
+	}
+	info, err = ops.Lstat(target)
+	if err != nil {
+		t.Fatalf("third Lstat() error = %v", err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("third Lstat() mode = %v, want regular file", info.Mode())
+	}
+}
+
+func TestFileOpsFaultsReadOnConfiguredCall(t *testing.T) {
+	target, _ := createTarget(t, "old\n", 0o640)
+	ops := newFaultOps()
+	ops.failAt["read"] = 2
+
+	data, err := ops.ReadFile(target)
+	if err != nil {
+		t.Fatalf("first ReadFile() error = %v", err)
+	}
+	if !bytes.Equal(data, []byte("old\n")) {
+		t.Fatalf("first ReadFile() = %q, want %q", data, "old\n")
+	}
+	if _, err := ops.ReadFile(target); !errors.Is(err, ops.failErr["read"]) {
+		t.Fatalf("second ReadFile() error = %v, want %v", err, ops.failErr["read"])
+	}
+	data, err = ops.ReadFile(target)
+	if err != nil {
+		t.Fatalf("third ReadFile() error = %v", err)
+	}
+	if !bytes.Equal(data, []byte("old\n")) {
+		t.Fatalf("third ReadFile() = %q, want %q", data, "old\n")
+	}
+}
+
 func TestReplaceFileSuccess(t *testing.T) {
 	target, metadata := createTarget(t, "old\n", 0o640)
 	ops := newFaultOps()
@@ -199,6 +249,9 @@ func TestReplaceFileSuccess(t *testing.T) {
 	}
 	if len(ops.tempDirs) != 1 || ops.tempDirs[0] != filepath.Dir(target) {
 		t.Fatalf("CreateTemp directories = %q, want [%q]", ops.tempDirs, filepath.Dir(target))
+	}
+	if len(ops.openDirs) != 1 || ops.openDirs[0] != filepath.Dir(target) {
+		t.Fatalf("OpenDir paths = %q, want [%q]", ops.openDirs, filepath.Dir(target))
 	}
 	assertNoTempFiles(t, target, ops.tempPaths)
 
@@ -302,6 +355,37 @@ func TestReplaceFileJoinsPreRenameCleanupFailures(t *testing.T) {
 	}
 	if _, statErr := os.Lstat(ops.tempPaths[0]); statErr != nil {
 		t.Fatalf("temporary path after injected remove failure: %v", statErr)
+	}
+	if removeErr := os.Remove(ops.tempPaths[0]); removeErr != nil {
+		t.Fatalf("clean injected leftover temp: %v", removeErr)
+	}
+}
+
+func TestReplaceFileJoinsIsolatedRemoveCleanupFailure(t *testing.T) {
+	target, metadata := createTarget(t, "old\n", 0o640)
+	ops := newFaultOps()
+	ops.failAt["write"] = 1
+	ops.failAt["remove"] = 1
+	store := newStore(ops)
+
+	renamed, err := store.replaceFile(t.Context(), target, []byte("new\n"), metadata)
+	if renamed {
+		t.Fatal("replaceFile() renamed = true, want false")
+	}
+	for _, operation := range []string{"write", "remove"} {
+		if !errors.Is(err, ops.failErr[operation]) {
+			t.Errorf("replaceFile() error = %v, want joined %s error", err, operation)
+		}
+	}
+	if errors.Is(err, ops.failErr["file_close"]) {
+		t.Fatalf("replaceFile() error = %v, do not want file-close failure", err)
+	}
+	if got := ops.calls["file_close"]; got != 1 {
+		t.Fatalf("file-close calls = %d, want 1 successful cleanup close", got)
+	}
+	assertFileContent(t, target, []byte("old\n"))
+	if len(ops.tempPaths) != 1 {
+		t.Fatalf("temporary paths = %q, want one", ops.tempPaths)
 	}
 	if removeErr := os.Remove(ops.tempPaths[0]); removeErr != nil {
 		t.Fatalf("clean injected leftover temp: %v", removeErr)
