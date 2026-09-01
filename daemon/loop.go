@@ -13,7 +13,6 @@ const eventStreamClosedMessage = "Docker event stream closed"
 
 func (d *Daemon) loop(
 	ctx context.Context,
-	cancel context.CancelFunc,
 	initialReconcileFailed bool,
 ) (error, bool) {
 	periodicTimer := time.NewTimer(d.config.PeriodicInterval)
@@ -60,6 +59,26 @@ func (d *Daemon) loop(
 		reconnectTimer = resetLoopTimer(reconnectTimer, reconnectDelay)
 		reconnectDelay = nextLoopBackoff(reconnectDelay, d.timing.retryMaxDelay)
 	}
+	streamErrorReady := func() (error, bool) {
+		select {
+		case err, ok := <-eventErrors:
+			if !ok {
+				return nil, true
+			}
+			return err, true
+		default:
+			return nil, false
+		}
+	}
+	observeEvent := func() {
+		reconnectDelay = d.timing.retryInitialDelay
+		stabilityTimer = stopLoopTimer(stabilityTimer)
+		d.tracker.Recover(health.ConcernDockerEvents)
+		if debounceTimer == nil {
+			maximumTimer = resetLoopTimer(maximumTimer, d.config.MaxDebounceDelay)
+		}
+		debounceTimer = resetLoopTimer(debounceTimer, d.config.DebounceDelay)
+	}
 	startStream()
 	if events == nil && eventErrors == nil {
 		disconnectStream(nil)
@@ -76,21 +95,28 @@ func (d *Daemon) loop(
 	}()
 
 	for {
+		if runErr, captured, stop := d.loopStop(ctx); stop {
+			return runErr, captured
+		}
 		if pending {
 			pending = false
+			periodicTimer = stopLoopTimer(periodicTimer)
 			debounceTimer = stopLoopTimer(debounceTimer)
 			maximumTimer = stopLoopTimer(maximumTimer)
 			retryTimer = stopLoopTimer(retryTimer)
-			if err := d.reconcile(ctx); err != nil {
+			reconcileErr := d.reconcile(ctx)
+			if ctx.Err() == nil {
+				periodicTimer = resetLoopTimer(periodicTimer, d.config.PeriodicInterval)
+			}
+			if reconcileErr != nil {
 				if ctx.Err() == nil {
-					d.logger.Warn("reconciliation failed", "err", err)
+					d.logger.Warn("reconciliation failed", "err", reconcileErr)
 					retryTimer = resetLoopTimer(retryTimer, retryDelay)
 					retryDelay = nextLoopBackoff(retryDelay, d.timing.retryMaxDelay)
 				}
 				continue
 			}
 			retryDelay = d.timing.retryInitialDelay
-			periodicTimer = resetLoopTimer(periodicTimer, d.config.PeriodicInterval)
 			continue
 		}
 
@@ -99,23 +125,17 @@ func (d *Daemon) loop(
 			return nil, false
 		case <-d.server.Done():
 			serveErr := d.server.Err()
-			cancel()
 			if serveErr != nil {
 				return fmt.Errorf("health server stopped: %w", serveErr), true
 			}
 			return errHealthServerStopped, true
 		case _, ok := <-events:
 			if !ok {
-				disconnectStream(nil)
+				streamErr, _ := streamErrorReady()
+				disconnectStream(streamErr)
 				continue
 			}
-			reconnectDelay = d.timing.retryInitialDelay
-			stabilityTimer = stopLoopTimer(stabilityTimer)
-			d.tracker.Recover(health.ConcernDockerEvents)
-			if debounceTimer == nil {
-				maximumTimer = resetLoopTimer(maximumTimer, d.config.MaxDebounceDelay)
-			}
-			debounceTimer = resetLoopTimer(debounceTimer, d.config.DebounceDelay)
+			observeEvent()
 		case err, ok := <-eventErrors:
 			if !ok {
 				disconnectStream(nil)
@@ -146,9 +166,43 @@ func (d *Daemon) loop(
 			}
 		case <-loopTimerChannel(stabilityTimer):
 			stabilityTimer = stopLoopTimer(stabilityTimer)
+			if streamErr, ready := streamErrorReady(); ready {
+				disconnectStream(streamErr)
+				continue
+			}
+			select {
+			case _, ok := <-events:
+				if !ok {
+					streamErr, _ := streamErrorReady()
+					disconnectStream(streamErr)
+					continue
+				}
+				observeEvent()
+				continue
+			default:
+			}
 			reconnectDelay = d.timing.retryInitialDelay
 			d.tracker.Recover(health.ConcernDockerEvents)
 		}
+	}
+}
+
+func (d *Daemon) loopStop(ctx context.Context) (error, bool, bool) {
+	select {
+	case <-d.server.Done():
+		serveErr := d.server.Err()
+		if serveErr != nil {
+			return fmt.Errorf("health server stopped: %w", serveErr), true, true
+		}
+		return errHealthServerStopped, true, true
+	default:
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, false, true
+	default:
+		return nil, false, false
 	}
 }
 

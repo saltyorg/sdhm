@@ -70,10 +70,17 @@ func New(
 func (d *Daemon) Run(parent context.Context) error {
 	ctx, cancel := context.WithCancel(parent)
 	serverStarted := false
+	var watcherDone <-chan struct{}
+	finish := func(runErr error, serveErrCaptured bool) error {
+		cancel()
+		if watcherDone != nil {
+			<-watcherDone
+		}
+		return d.cleanup(serverStarted, runErr, serveErrCaptured)
+	}
 
 	if parent.Err() != nil {
-		cancel()
-		return d.cleanup(serverStarted, nil, false)
+		return finish(nil, false)
 	}
 
 	pingCtx, pingCancel := context.WithTimeout(ctx, d.timing.dockerOperationTimeout)
@@ -84,12 +91,10 @@ func (d *Daemon) Run(parent context.Context) error {
 		if parent.Err() == nil {
 			runErr = fmt.Errorf("ping Docker: %w", err)
 		}
-		cancel()
-		return d.cleanup(serverStarted, runErr, false)
+		return finish(runErr, false)
 	}
 	if parent.Err() != nil {
-		cancel()
-		return d.cleanup(serverStarted, nil, false)
+		return finish(nil, false)
 	}
 
 	if err := d.server.Start(); err != nil {
@@ -97,42 +102,46 @@ func (d *Daemon) Run(parent context.Context) error {
 		if parent.Err() == nil {
 			runErr = fmt.Errorf("start health server: %w", err)
 		}
-		cancel()
-		return d.cleanup(serverStarted, runErr, false)
+		return finish(runErr, false)
 	}
 	serverStarted = true
+	watcher := make(chan struct{})
+	watcherDone = watcher
+	go func() {
+		defer close(watcher)
+		select {
+		case <-ctx.Done():
+		case <-d.server.Done():
+			cancel()
+		}
+	}()
 	if runErr, captured, stop := d.startupStop(parent); stop {
-		cancel()
-		return d.cleanup(serverStarted, runErr, captured)
+		return finish(runErr, captured)
 	}
 
 	if err := d.store.Prepare(ctx); err != nil {
 		var runErr error
-		if parent.Err() == nil {
+		if parent.Err() == nil && (ctx.Err() == nil || !errors.Is(err, ctx.Err())) {
 			d.tracker.Fail(health.ConcernRecovery, err.Error())
 			runErr = fmt.Errorf("prepare hosts store: %w", err)
 		}
-		cancel()
-		return d.cleanup(serverStarted, runErr, false)
+		return finish(runErr, false)
 	}
 	d.tracker.Recover(health.ConcernRecovery)
 	if runErr, captured, stop := d.startupStop(parent); stop {
-		cancel()
-		return d.cleanup(serverStarted, runErr, captured)
+		return finish(runErr, captured)
 	}
 
 	initialReconcileErr := d.reconcile(ctx)
-	if initialReconcileErr != nil && parent.Err() == nil {
+	if initialReconcileErr != nil && parent.Err() == nil && ctx.Err() == nil {
 		d.logger.Warn("initial reconciliation failed", "err", initialReconcileErr)
 	}
 	if runErr, captured, stop := d.startupStop(parent); stop {
-		cancel()
-		return d.cleanup(serverStarted, runErr, captured)
+		return finish(runErr, captured)
 	}
 
-	runErr, serveErrCaptured := d.loop(ctx, cancel, initialReconcileErr != nil)
-	cancel()
-	return d.cleanup(serverStarted, runErr, serveErrCaptured)
+	runErr, serveErrCaptured := d.loop(ctx, initialReconcileErr != nil)
+	return finish(runErr, serveErrCaptured)
 }
 
 func (d *Daemon) reconcile(ctx context.Context) error {
@@ -140,7 +149,7 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	endpoints, err := d.source.Snapshot(snapshotCtx, slices.Clone(d.config.Networks))
 	cancel()
 	if err != nil {
-		if ctx.Err() == nil {
+		if ctx.Err() == nil || !errors.Is(err, ctx.Err()) {
 			d.tracker.Fail(health.ConcernDockerSnapshot, err.Error())
 		}
 		return fmt.Errorf("snapshot Docker networks: %w", err)
@@ -148,7 +157,7 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	d.tracker.Recover(health.ConcernDockerSnapshot)
 
 	if err := d.store.Apply(ctx, endpoints); err != nil {
-		if ctx.Err() == nil {
+		if ctx.Err() == nil || !errors.Is(err, ctx.Err()) {
 			d.tracker.Fail(health.ConcernHostsApply, err.Error())
 		}
 		return fmt.Errorf("apply hosts snapshot: %w", err)

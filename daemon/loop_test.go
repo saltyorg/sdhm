@@ -37,9 +37,13 @@ type loopTestSource struct {
 	closed          chan struct{}
 	allCanceled     chan bool
 	mutateNetworks  func([]string)
+	onSnapshot      func(context.Context, int)
+	onEvents        func(context.Context, int)
 	closeOnce       sync.Once
 	streamMu        sync.Mutex
 	streamContexts  []context.Context
+	snapshotCount   atomic.Int64
+	eventCallCount  atomic.Int64
 }
 
 type loopTestStore struct {
@@ -81,11 +85,15 @@ func (*loopTestSource) Ping(context.Context) error {
 }
 
 func (s *loopTestSource) Snapshot(ctx context.Context, networks []string) ([]Endpoint, error) {
+	callNumber := int(s.snapshotCount.Add(1))
 	call := loopTestSnapshot{at: time.Now(), networks: slices.Clone(networks)}
 	select {
 	case s.snapshots <- call:
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+	if s.onSnapshot != nil {
+		s.onSnapshot(ctx, callNumber)
 	}
 
 	select {
@@ -97,6 +105,7 @@ func (s *loopTestSource) Snapshot(ctx context.Context, networks []string) ([]End
 }
 
 func (s *loopTestSource) Events(ctx context.Context, networks []string) (<-chan Event, <-chan error) {
+	callNumber := int(s.eventCallCount.Add(1))
 	s.streamMu.Lock()
 	s.streamContexts = append(s.streamContexts, ctx)
 	s.streamMu.Unlock()
@@ -108,6 +117,9 @@ func (s *loopTestSource) Events(ctx context.Context, networks []string) (<-chan 
 	case s.streamCalls <- call:
 	case <-ctx.Done():
 		return nil, nil
+	}
+	if s.onEvents != nil {
+		s.onEvents(ctx, callNumber)
 	}
 
 	select {
@@ -139,6 +151,7 @@ type loopTestHarness struct {
 	source   *loopTestSource
 	stream   loopTestStream
 	server   *orderedHealthServer
+	daemon   *Daemon
 	cancel   context.CancelFunc
 	result   chan error
 	stopOnce sync.Once
@@ -183,6 +196,7 @@ func newLoopTestHarnessWith(
 		source: source,
 		stream: stream,
 		server: server,
+		daemon: daemon,
 		cancel: cancel,
 		result: result,
 	}
@@ -204,8 +218,13 @@ func (h *loopTestHarness) stop(t *testing.T) {
 
 func (h *loopTestHarness) shutdown(t *testing.T) error {
 	t.Helper()
+	h.cancel()
+	return h.wait(t)
+}
+
+func (h *loopTestHarness) wait(t *testing.T) error {
+	t.Helper()
 	h.stopOnce.Do(func() {
-		h.cancel()
 		h.stopErr = receiveLoopValue(t, h.result, "daemon shutdown")
 	})
 	return h.stopErr
@@ -213,6 +232,12 @@ func (h *loopTestHarness) shutdown(t *testing.T) error {
 
 func newLoopTestStream() loopTestStream {
 	return loopTestStream{events: make(chan Event, 16), errors: make(chan error, 16)}
+}
+
+func failLoopTestStream(stream loopTestStream, err error) {
+	stream.errors <- err
+	close(stream.errors)
+	close(stream.events)
 }
 
 func TestLoopPeriodicIntervalReconcilesImmediately(t *testing.T) {
@@ -429,6 +454,49 @@ func TestLoopRetryBackoffStopsAtMaximum(t *testing.T) {
 	})
 }
 
+func TestLoopSimultaneousPeriodicAndRetryTriggersOneAttempt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		for range 100 {
+			cfg := loopTestConfig()
+			cfg.PeriodicInterval = retryInitialDelay
+			source := newLoopTestSource()
+			source.snapshotResults <- errors.New("initial snapshot failure")
+			source.snapshotResults <- errors.New("simultaneous-trigger snapshot failure")
+			attemptStarted := make(chan struct{}, 1)
+			releaseAttempt := make(chan struct{})
+			source.onSnapshot = func(ctx context.Context, call int) {
+				if call != 2 {
+					return
+				}
+				attemptStarted <- struct{}{}
+				select {
+				case <-releaseAttempt:
+				case <-ctx.Done():
+				}
+			}
+			harness := newLoopTestHarnessWith(t, cfg, source, newLoopTestStore(), health.NewTracker(), nil)
+			defer harness.stop(t)
+			initial, _ := harness.start(t)
+
+			attempt := receiveLoopValue(t, source.snapshots, "simultaneous periodic/retry attempt")
+			receiveLoopValue(t, attemptStarted, "blocked simultaneous periodic/retry attempt")
+			if delay := attempt.at.Sub(initial.at); delay != retryInitialDelay {
+				t.Fatalf("simultaneous-trigger attempt delay = %v, want %v", delay, retryInitialDelay)
+			}
+			harness.daemon.config.PeriodicInterval = time.Hour
+			close(releaseAttempt)
+			synctest.Wait()
+			assertNoLoopSnapshot(t, source.snapshots)
+
+			nextRetry := receiveLoopValue(t, source.snapshots, "retry after simultaneous triggers")
+			if delay := nextRetry.at.Sub(attempt.at); delay != 2*retryInitialDelay {
+				t.Fatalf("retry delay after simultaneous triggers = %v, want %v", delay, 2*retryInitialDelay)
+			}
+			harness.stop(t)
+		}
+	})
+}
+
 func TestLoopEventPreemptsRetryWithoutLeavingDuplicateTimer(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := loopTestConfig()
@@ -497,7 +565,7 @@ func TestLoopReconnectBackoffProgressesAcrossFreshChannels(t *testing.T) {
 			nextStream := newLoopTestStream()
 			source.streams <- nextStream
 			failedAt := time.Now()
-			currentStream.errors <- errors.New("event stream failure")
+			failLoopTestStream(currentStream, errors.New("event stream failure"))
 			synctest.Wait()
 			assertActiveConcerns(t, tracker, health.ConcernDockerEvents)
 
@@ -527,6 +595,31 @@ func TestLoopReconnectBackoffProgressesAcrossFreshChannels(t *testing.T) {
 	})
 }
 
+func TestLoopProductionShapedStreamFailurePreservesBufferedError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		for range 100 {
+			tracker := health.NewTracker()
+			harness := newLoopTestHarnessWith(
+				t,
+				loopTestConfig(),
+				newLoopTestSource(),
+				newLoopTestStore(),
+				tracker,
+				nil,
+			)
+			defer harness.stop(t)
+			harness.start(t)
+
+			streamErr := errors.New("production-shaped stream failure")
+			failLoopTestStream(harness.stream, streamErr)
+			synctest.Wait()
+			assertActiveConcerns(t, tracker, health.ConcernDockerEvents)
+			assertNewestHealthMessage(t, tracker, streamErr.Error())
+			harness.stop(t)
+		}
+	})
+}
+
 func TestLoopValidEventResetsReconnectBackoffAndRecoversHealth(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := loopTestConfig()
@@ -538,12 +631,12 @@ func TestLoopValidEventResetsReconnectBackoffAndRecoversHealth(t *testing.T) {
 
 		secondStream := newLoopTestStream()
 		source.streams <- secondStream
-		harness.stream.errors <- errors.New("first stream failure")
+		failLoopTestStream(harness.stream, errors.New("first stream failure"))
 		receiveLoopValue(t, source.streamCalls, "first reconnected stream")
 
 		thirdStream := newLoopTestStream()
 		source.streams <- thirdStream
-		secondStream.errors <- errors.New("second stream failure")
+		failLoopTestStream(secondStream, errors.New("second stream failure"))
 		receiveLoopValue(t, source.streamCalls, "second reconnected stream")
 		synctest.Wait()
 		assertActiveConcerns(t, tracker, health.ConcernDockerEvents)
@@ -555,7 +648,7 @@ func TestLoopValidEventResetsReconnectBackoffAndRecoversHealth(t *testing.T) {
 		fourthStream := newLoopTestStream()
 		source.streams <- fourthStream
 		failedAt := time.Now()
-		thirdStream.errors <- errors.New("failure after valid event")
+		failLoopTestStream(thirdStream, errors.New("failure after valid event"))
 		nextCall := receiveLoopValue(t, source.streamCalls, "event-reset reconnected stream")
 		if delay := nextCall.at.Sub(failedAt); delay != retryInitialDelay {
 			t.Fatalf("reconnect delay after valid event = %v, want reset %v", delay, retryInitialDelay)
@@ -574,12 +667,12 @@ func TestLoopStableStreamResetsReconnectBackoffAndRecoversHealth(t *testing.T) {
 
 		secondStream := newLoopTestStream()
 		source.streams <- secondStream
-		harness.stream.errors <- errors.New("first stream failure")
+		failLoopTestStream(harness.stream, errors.New("first stream failure"))
 		receiveLoopValue(t, source.streamCalls, "first reconnected stream")
 
 		thirdStream := newLoopTestStream()
 		source.streams <- thirdStream
-		secondStream.errors <- errors.New("second stream failure")
+		failLoopTestStream(secondStream, errors.New("second stream failure"))
 		receiveLoopValue(t, source.streamCalls, "second reconnected stream")
 		synctest.Wait()
 		assertActiveConcerns(t, tracker, health.ConcernDockerEvents)
@@ -591,10 +684,74 @@ func TestLoopStableStreamResetsReconnectBackoffAndRecoversHealth(t *testing.T) {
 		fourthStream := newLoopTestStream()
 		source.streams <- fourthStream
 		failedAt := time.Now()
-		thirdStream.errors <- errors.New("failure after stable stream")
+		failLoopTestStream(thirdStream, errors.New("failure after stable stream"))
 		nextCall := receiveLoopValue(t, source.streamCalls, "stability-reset reconnected stream")
 		if delay := nextCall.at.Sub(failedAt); delay != retryInitialDelay {
 			t.Fatalf("reconnect delay after stable stream = %v, want reset %v", delay, retryInitialDelay)
+		}
+	})
+}
+
+func TestLoopStreamFailureOutranksExpiredStabilityAfterBlockedReconcile(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		for range 100 {
+			cfg := loopTestConfig()
+			cfg.PeriodicInterval = 4 * time.Second
+			source := newLoopTestSource()
+			store := newLoopTestStore()
+			releaseApply := make(chan struct{})
+			store.onApply = func(ctx context.Context, call int) error {
+				if call != 2 {
+					return nil
+				}
+				select {
+				case <-releaseApply:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			tracker := health.NewTracker()
+			harness := newLoopTestHarnessWith(t, cfg, source, store, tracker, nil)
+			defer harness.stop(t)
+			harness.start(t)
+			if call := receiveLoopValue(t, store.applyCalls, "initial apply"); call != 1 {
+				t.Fatalf("initial Apply() call = %d, want 1", call)
+			}
+
+			secondStream := newLoopTestStream()
+			source.streams <- secondStream
+			failLoopTestStream(harness.stream, errors.New("first stream failure"))
+			receiveLoopValue(t, source.streamCalls, "first reconnected stream")
+
+			thirdStream := newLoopTestStream()
+			source.streams <- thirdStream
+			failLoopTestStream(secondStream, errors.New("second stream failure"))
+			thirdCall := receiveLoopValue(t, source.streamCalls, "second reconnected stream")
+
+			receiveLoopValue(t, source.snapshots, "periodic reconciliation before stability race")
+			if call := receiveLoopValue(t, store.applyCalls, "blocked apply before stability race"); call != 2 {
+				t.Fatalf("blocked Apply() call = %d, want 2", call)
+			}
+
+			failureAt := thirdCall.at.Add(streamStabilityDelay - time.Second)
+			advanceLoopTime(t, failureAt.Sub(time.Now()))
+			streamErr := errors.New("stream failure before stability threshold")
+			failLoopTestStream(thirdStream, streamErr)
+			advanceLoopTime(t, 2*time.Second)
+
+			fourthStream := newLoopTestStream()
+			source.streams <- fourthStream
+			releasedAt := time.Now()
+			close(releaseApply)
+			nextCall := receiveLoopValue(t, source.streamCalls, "reconnect after expired stability race")
+			if delay := nextCall.at.Sub(releasedAt); delay != 4*time.Second {
+				t.Fatalf("reconnect delay after expired stability race = %v, want 4s", delay)
+			}
+			synctest.Wait()
+			assertActiveConcerns(t, tracker, health.ConcernDockerEvents)
+			assertNewestHealthMessage(t, tracker, streamErr.Error())
+			harness.stop(t)
 		}
 	})
 }
@@ -635,6 +792,58 @@ func TestLoopClosedStreamChannelReconnectsAndDegradesHealth(t *testing.T) {
 	}
 }
 
+func TestLoopReadyStopOutranksPendingPeriodicReconciliation(t *testing.T) {
+	tests := []struct {
+		name string
+		stop func(*loopTestHarness, error)
+	}{
+		{name: "caller cancellation", stop: func(harness *loopTestHarness, _ error) { harness.cancel() }},
+		{name: "health server completion", stop: func(harness *loopTestHarness, serveErr error) { harness.server.finish(serveErr) }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				for range 100 {
+					cfg := loopTestConfig()
+					cfg.PeriodicInterval = time.Second
+					source := newLoopTestSource()
+					streamBlocked := make(chan struct{}, 1)
+					releaseStream := make(chan struct{})
+					source.onEvents = func(_ context.Context, call int) {
+						if call != 1 {
+							return
+						}
+						streamBlocked <- struct{}{}
+						<-releaseStream
+					}
+					harness := newLoopTestHarnessWith(t, cfg, source, newLoopTestStore(), health.NewTracker(), nil)
+					defer func() { _ = harness.shutdown(t) }()
+					harness.start(t)
+					receiveLoopValue(t, streamBlocked, "blocked initial event stream")
+					serveErr := errors.New("serve failure")
+
+					advanceLoopTime(t, cfg.PeriodicInterval)
+					tt.stop(harness, serveErr)
+					close(releaseStream)
+
+					err := harness.wait(t)
+					if tt.name == "caller cancellation" {
+						if err != nil {
+							t.Fatalf("Run() error = %v after caller cancellation, want nil", err)
+						}
+					} else if !errors.Is(err, serveErr) {
+						t.Fatalf("Run() error = %v, want wrapped %v", err, serveErr)
+					}
+					if calls := harness.source.snapshotCount.Load(); calls != 1 {
+						t.Fatalf("Snapshot() calls = %d, want only initial reconciliation", calls)
+					}
+				}
+			})
+		})
+	}
+}
+
 func TestLoopHealthServerTerminationCancelsStreamAndPreservesClassification(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -669,6 +878,42 @@ func TestLoopHealthServerTerminationCancelsStreamAndPreservesClassification(t *t
 			})
 		})
 	}
+}
+
+func TestRunHealthWatcherCancelsBlockedApplyAndJoinsBeforeReturn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := loopTestConfig()
+		source := newLoopTestSource()
+		store := newLoopTestStore()
+		store.onApply = func(ctx context.Context, call int) error {
+			if call != 1 {
+				return nil
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		tracker := health.NewTracker()
+		harness := newLoopTestHarnessWith(t, cfg, source, store, tracker, nil)
+		defer func() { _ = harness.shutdown(t) }()
+		receiveLoopValue(t, source.snapshots, "initial reconciliation before blocked apply")
+		if call := receiveLoopValue(t, store.applyCalls, "blocked initial apply"); call != 1 {
+			t.Fatalf("blocked Apply() call = %d, want 1", call)
+		}
+
+		serveErr := errors.New("serve failure during apply")
+		harness.server.finish(serveErr)
+		err := harness.wait(t)
+		if !errors.Is(err, serveErr) {
+			t.Fatalf("Run() error = %v, want wrapped %v", err, serveErr)
+		}
+		if errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, must not expose watcher cancellation", err)
+		}
+		if calls := source.snapshotCount.Load(); calls != 1 {
+			t.Fatalf("Snapshot() calls = %d, want only blocked initial reconciliation", calls)
+		}
+		assertActiveConcerns(t, tracker)
+	})
 }
 
 func loopTestConfig() Config {
