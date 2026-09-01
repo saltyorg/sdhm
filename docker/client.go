@@ -89,20 +89,20 @@ func (c *Client) Snapshot(ctx context.Context, networks []string) ([]daemon.Endp
 				continue
 			}
 			if settings == nil {
-				return nil, fmt.Errorf("container %q network %q has no endpoint settings", item.ID, networkName)
+				continue
 			}
 
 			ip := settings.IPAddress
 			if !ip.Is4() {
 				ip = settings.GlobalIPv6Address
 				if !ip.Is6() {
-					return nil, fmt.Errorf("container %q network %q has no valid address", item.ID, networkName)
+					continue
 				}
 			}
 
 			aliases := normalizeAliases(settings.Aliases)
 			if len(aliases) == 0 {
-				return nil, fmt.Errorf("container %q network %q has no aliases", item.ID, networkName)
+				continue
 			}
 
 			endpoints = append(endpoints, daemon.Endpoint{

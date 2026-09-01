@@ -263,7 +263,7 @@ func TestSnapshotSkipsDisconnectedConfiguredNetwork(t *testing.T) {
 	assertEndpointsEqual(t, got, want)
 }
 
-func TestSnapshotRejectsMalformedPresentEndpoint(t *testing.T) {
+func TestSnapshotSkipsUnpublishableEndpointAndKeepsHealthyContainer(t *testing.T) {
 	tests := []struct {
 		name     string
 		endpoint *network.EndpointSettings
@@ -294,51 +294,58 @@ func TestSnapshotRejectsMalformedPresentEndpoint(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			api := newFakeAPI()
 			api.listFn = func(context.Context, mobyclient.ContainerListOptions) (mobyclient.ContainerListResult, error) {
-				return listResult("container-1"), nil
+				return listResult("healthy-container", "unpublishable-container"), nil
 			}
-			api.inspectFn = func(context.Context, string, mobyclient.ContainerInspectOptions) (mobyclient.ContainerInspectResult, error) {
-				return inspectResult(map[string]*network.EndpointSettings{"saltbox": tt.endpoint}), nil
+			api.inspectFn = func(_ context.Context, id string, _ mobyclient.ContainerInspectOptions) (mobyclient.ContainerInspectResult, error) {
+				switch id {
+				case "healthy-container":
+					return inspectResult(map[string]*network.EndpointSettings{
+						"saltbox": endpoint("172.19.0.2", "", []string{"radarr"}, nil),
+					}), nil
+				case "unpublishable-container":
+					return inspectResult(map[string]*network.EndpointSettings{"saltbox": tt.endpoint}), nil
+				default:
+					t.Fatalf("unexpected container ID %q", id)
+					return mobyclient.ContainerInspectResult{}, nil
+				}
 			}
 
 			got, err := newClient(api).Snapshot(t.Context(), []string{"saltbox"})
-			if err == nil {
-				t.Fatal("Snapshot() error = nil, want malformed-endpoint error")
+			if err != nil {
+				t.Fatalf("Snapshot() error = %v", err)
 			}
-			if got != nil {
-				t.Fatalf("Snapshot() endpoints = %v, want nil", got)
-			}
+			want := []daemon.Endpoint{{
+				Network: "saltbox",
+				IP:      netip.MustParseAddr("172.19.0.2"),
+				Aliases: []string{"radarr"},
+			}}
+			assertEndpointsEqual(t, got, want)
 		})
 	}
 }
 
-func TestSnapshotDiscardsAccumulatedEndpointsOnMalformedLaterEndpoint(t *testing.T) {
+func TestSnapshotSkipsUnpublishableNetworkAndKeepsOtherNetwork(t *testing.T) {
 	api := newFakeAPI()
 	api.listFn = func(context.Context, mobyclient.ContainerListOptions) (mobyclient.ContainerListResult, error) {
-		return listResult("valid-container", "malformed-container"), nil
+		return listResult("container-1"), nil
 	}
-	api.inspectFn = func(_ context.Context, id string, _ mobyclient.ContainerInspectOptions) (mobyclient.ContainerInspectResult, error) {
-		switch id {
-		case "valid-container":
-			return inspectResult(map[string]*network.EndpointSettings{
-				"saltbox": endpoint("172.19.0.2", "", []string{"radarr"}, nil),
-			}), nil
-		case "malformed-container":
-			return inspectResult(map[string]*network.EndpointSettings{
-				"saltbox": endpoint("172.19.0.3", "", nil, []string{"sonarr"}),
-			}), nil
-		default:
-			t.Fatalf("unexpected container ID %q", id)
-			return mobyclient.ContainerInspectResult{}, nil
-		}
+	api.inspectFn = func(context.Context, string, mobyclient.ContainerInspectOptions) (mobyclient.ContainerInspectResult, error) {
+		return inspectResult(map[string]*network.EndpointSettings{
+			"saltbox": endpoint("", "", []string{"radarr"}, nil),
+			"backend": endpoint("172.20.0.2", "", []string{"radarr"}, nil),
+		}), nil
 	}
 
-	got, err := newClient(api).Snapshot(t.Context(), []string{"saltbox"})
-	if err == nil {
-		t.Fatal("Snapshot() error = nil, want malformed-endpoint error")
+	got, err := newClient(api).Snapshot(t.Context(), []string{"saltbox", "backend"})
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
 	}
-	if got != nil {
-		t.Fatalf("Snapshot() endpoints = %+v, want nil after later malformed endpoint", got)
-	}
+	want := []daemon.Endpoint{{
+		Network: "backend",
+		IP:      netip.MustParseAddr("172.20.0.2"),
+		Aliases: []string{"radarr"},
+	}}
+	assertEndpointsEqual(t, got, want)
 }
 
 func TestSnapshotUsesIPv6FallbackAndOnlyInspectedAliases(t *testing.T) {
