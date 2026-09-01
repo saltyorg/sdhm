@@ -7,7 +7,11 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"syscall"
+
+	"github.com/saltyorg/sdhm/daemon"
 )
 
 type fileMetadata struct {
@@ -18,11 +22,311 @@ type fileMetadata struct {
 }
 
 type Store struct {
-	ops fileOps
+	ops            fileOps
+	hostsPath      string
+	backupPath     string
+	beginMarker    string
+	endMarker      string
+	defaultNetwork string
+	hostname       func() (string, error)
 }
 
 func newStore(ops fileOps) *Store {
-	return &Store{ops: ops}
+	return &Store{ops: ops, hostname: os.Hostname}
+}
+
+// NewStore creates a transactional managed-hosts store.
+func NewStore(hostsPath, backupPath, sectionName, defaultNetwork string) *Store {
+	return &Store{
+		ops:            osFileOps{},
+		hostsPath:      hostsPath,
+		backupPath:     backupPath,
+		beginMarker:    "# BEGIN " + sectionName,
+		endMarker:      "# END " + sectionName,
+		defaultNetwork: defaultNetwork,
+		hostname:       os.Hostname,
+	}
+}
+
+var _ daemon.HostStore = (*Store)(nil)
+
+// Prepare validates the hosts file, creates an initial managed section when
+// none exists, and recovers corrupt markers only from a validated backup.
+func (s *Store) Prepare(ctx context.Context) error {
+	if err := checkContext(ctx, "prepare hosts file"); err != nil {
+		return err
+	}
+
+	current, metadata, err := s.readRegularFile(s.hostsPath)
+	if err != nil {
+		return fmt.Errorf("read hosts file: %w", err)
+	}
+	state, _, markerErr := locateMarkers(current, s.beginMarker, s.endMarker)
+	if markerErr == nil && state == validMarkers {
+		return s.ensureBackup(ctx, current, metadata)
+	}
+	if markerErr == nil && state == noMarkers {
+		proposed := appendEmptySection(current, s.beginMarker, s.endMarker)
+		if err := requireValidMarkers(proposed, s.beginMarker, s.endMarker); err != nil {
+			return fmt.Errorf("validate initialized hosts file: %w", err)
+		}
+		return s.initializeManagedSection(ctx, current, proposed, metadata)
+	}
+
+	backup, _, err := s.readRegularFile(s.backupPath)
+	if err != nil {
+		return fmt.Errorf("recover corrupt hosts file: %w", errors.Join(markerErr, err))
+	}
+	if err := requireValidMarkers(backup, s.beginMarker, s.endMarker); err != nil {
+		return fmt.Errorf("recover corrupt hosts file: invalid backup: %w", errors.Join(markerErr, err))
+	}
+	if err := s.restoreTarget(ctx, s.hostsPath, backup, metadata); err != nil {
+		return fmt.Errorf("recover corrupt hosts file: %w", err)
+	}
+	return nil
+}
+
+// Apply replaces the managed body from one complete endpoint snapshot.
+func (s *Store) Apply(ctx context.Context, endpoints []daemon.Endpoint) error {
+	if err := checkContext(ctx, "apply hosts snapshot"); err != nil {
+		return err
+	}
+
+	current, metadata, err := s.readRegularFile(s.hostsPath)
+	if err != nil {
+		return fmt.Errorf("read hosts file: %w", err)
+	}
+	state, section, err := locateMarkers(current, s.beginMarker, s.endMarker)
+	if err != nil {
+		return fmt.Errorf("validate hosts file: %w", err)
+	}
+	if state != validMarkers {
+		return fmt.Errorf("validate hosts file: managed markers are missing")
+	}
+
+	body, err := renderEndpoints(endpoints, s.defaultNetwork)
+	if err != nil {
+		return fmt.Errorf("render hosts entries: %w", err)
+	}
+	proposed := replaceManagedSection(current, section, body)
+	if err := requireValidMarkers(proposed, s.beginMarker, s.endMarker); err != nil {
+		return fmt.Errorf("validate proposed hosts file: %w", err)
+	}
+	if bytes.Equal(current, proposed) {
+		return nil
+	}
+
+	return s.applyReplacement(ctx, current, proposed, metadata)
+}
+
+// Regenerate replaces the hosts file with Ubuntu-compatible baseline content.
+// A valid prior target becomes the backup; corrupt target bytes never do.
+func (s *Store) Regenerate(ctx context.Context) error {
+	if err := checkContext(ctx, "regenerate hosts file"); err != nil {
+		return err
+	}
+
+	hostname, err := s.hostname()
+	if err != nil {
+		return fmt.Errorf("read system hostname: %w", err)
+	}
+	if err := validateHostnamePart(hostname); err != nil {
+		return fmt.Errorf("system hostname %q: %w", hostname, err)
+	}
+	fresh := freshHostsFile(hostname, s.beginMarker, s.endMarker)
+	if err := requireValidMarkers(fresh, s.beginMarker, s.endMarker); err != nil {
+		return fmt.Errorf("validate regenerated hosts file: %w", err)
+	}
+
+	current, targetMetadata, targetExists, err := s.readOptionalRegularFile(s.hostsPath)
+	if err != nil {
+		return fmt.Errorf("inspect hosts file: %w", err)
+	}
+	if !targetExists {
+		targetMetadata = defaultFileMetadata()
+	}
+	if targetExists {
+		if err := requireValidMarkers(current, s.beginMarker, s.endMarker); err == nil {
+			return s.applyReplacement(ctx, current, fresh, targetMetadata)
+		}
+	}
+
+	backup, backupMetadata, backupExists, err := s.readOptionalRegularFile(s.backupPath)
+	if err != nil {
+		return fmt.Errorf("inspect backup: %w", err)
+	}
+	backupValid := false
+	if backupExists {
+		backupValid = requireValidMarkers(backup, s.beginMarker, s.endMarker) == nil
+	} else {
+		backupMetadata = targetMetadata
+	}
+	if !backupValid {
+		if _, err := s.replaceFile(ctx, s.backupPath, fresh, backupMetadata); err != nil {
+			return fmt.Errorf("seed regenerated backup: %w", err)
+		}
+	}
+
+	if _, err := s.replaceFile(ctx, s.hostsPath, fresh, targetMetadata); err != nil {
+		return fmt.Errorf("replace hosts file with regenerated content: %w", err)
+	}
+	return nil
+}
+
+// applyReplacement refreshes the backup from caller-validated current bytes,
+// installs caller-validated proposed bytes, and restores only the target after
+// a failure that occurs after the target rename.
+func (s *Store) applyReplacement(ctx context.Context, current, proposed []byte, targetMetadata fileMetadata) error {
+	_, backupMetadata, exists, err := s.readOptionalRegularFile(s.backupPath)
+	if err != nil {
+		return fmt.Errorf("inspect backup: %w", err)
+	}
+	if !exists {
+		backupMetadata = targetMetadata
+	}
+
+	if _, err := s.replaceFile(ctx, s.backupPath, current, backupMetadata); err != nil {
+		return fmt.Errorf("refresh backup: %w", err)
+	}
+
+	renamed, err := s.replaceFile(ctx, s.hostsPath, proposed, targetMetadata)
+	if err == nil {
+		return nil
+	}
+	primaryErr := fmt.Errorf("replace hosts file: %w", err)
+	if !renamed {
+		return primaryErr
+	}
+	rollbackErr := s.restoreTarget(ctx, s.hostsPath, current, targetMetadata)
+	return errors.Join(primaryErr, rollbackErr)
+}
+
+func (s *Store) ensureBackup(ctx context.Context, validTarget []byte, targetMetadata fileMetadata) error {
+	backup, metadata, exists, err := s.readOptionalRegularFile(s.backupPath)
+	if err != nil {
+		return fmt.Errorf("inspect backup: %w", err)
+	}
+	if exists {
+		if err := requireValidMarkers(backup, s.beginMarker, s.endMarker); err == nil {
+			return nil
+		}
+	} else {
+		metadata = targetMetadata
+	}
+
+	if _, err := s.replaceFile(ctx, s.backupPath, validTarget, metadata); err != nil {
+		return fmt.Errorf("seed backup: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) initializeManagedSection(ctx context.Context, current, proposed []byte, targetMetadata fileMetadata) error {
+	_, backupMetadata, exists, err := s.readOptionalRegularFile(s.backupPath)
+	if err != nil {
+		return fmt.Errorf("inspect backup: %w", err)
+	}
+	if !exists {
+		backupMetadata = targetMetadata
+	}
+	if _, err := s.replaceFile(ctx, s.backupPath, proposed, backupMetadata); err != nil {
+		return fmt.Errorf("seed initialized backup: %w", err)
+	}
+
+	renamed, err := s.replaceFile(ctx, s.hostsPath, proposed, targetMetadata)
+	if err == nil {
+		return nil
+	}
+	primaryErr := fmt.Errorf("initialize managed section: %w", err)
+	if !renamed {
+		return primaryErr
+	}
+	rollbackErr := s.restoreTarget(ctx, s.hostsPath, current, targetMetadata)
+	return errors.Join(primaryErr, rollbackErr)
+}
+
+func (s *Store) readRegularFile(path string) ([]byte, fileMetadata, error) {
+	data, metadata, exists, err := s.readOptionalRegularFile(path)
+	if err != nil {
+		return nil, fileMetadata{}, err
+	}
+	if !exists {
+		return nil, fileMetadata{}, fmt.Errorf("%q does not exist: %w", path, fs.ErrNotExist)
+	}
+	return data, metadata, nil
+}
+
+func (s *Store) readOptionalRegularFile(path string) ([]byte, fileMetadata, bool, error) {
+	info, err := s.ops.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fileMetadata{}, false, nil
+	}
+	if err != nil {
+		return nil, fileMetadata{}, false, fmt.Errorf("lstat %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fileMetadata{}, false, fmt.Errorf("%q is not a regular file", path)
+	}
+
+	data, err := s.ops.ReadFile(path)
+	if err != nil {
+		return nil, fileMetadata{}, false, fmt.Errorf("read %q: %w", path, err)
+	}
+	return data, metadataFromInfo(info), true, nil
+}
+
+func metadataFromInfo(info fs.FileInfo) fileMetadata {
+	metadata := fileMetadata{mode: info.Mode().Perm()}
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		metadata.uid = int(stat.Uid)
+		metadata.gid = int(stat.Gid)
+		metadata.setOwnership = true
+	}
+	return metadata
+}
+
+func defaultFileMetadata() fileMetadata {
+	return fileMetadata{
+		mode:         0o644,
+		uid:          os.Getuid(),
+		gid:          os.Getgid(),
+		setOwnership: true,
+	}
+}
+
+func freshHostsFile(hostname, beginMarker, endMarker string) []byte {
+	return fmt.Appendf(nil, "127.0.0.1\tlocalhost\n"+
+		"127.0.1.1\t%s\n"+
+		"\n"+
+		"# The following lines are desirable for IPv6 capable hosts\n"+
+		"::1\tip6-localhost ip6-loopback\n"+
+		"fe00::0\tip6-localnet\n"+
+		"ff00::0\tip6-mcastprefix\n"+
+		"ff02::1\tip6-allnodes\n"+
+		"ff02::2\tip6-allrouters\n"+
+		"ff02::3\tip6-allhosts\n"+
+		"\n"+
+		"%s\n"+
+		"%s\n", hostname, beginMarker, endMarker)
+}
+
+func appendEmptySection(data []byte, beginMarker, endMarker string) []byte {
+	appended := bytes.Clone(data)
+	if len(appended) > 0 && appended[len(appended)-1] != '\n' {
+		appended = append(appended, '\n')
+	}
+	appended = fmt.Appendf(appended, "%s\n%s\n", beginMarker, endMarker)
+	return appended
+}
+
+func requireValidMarkers(data []byte, beginMarker, endMarker string) error {
+	state, _, err := locateMarkers(data, beginMarker, endMarker)
+	if err != nil {
+		return err
+	}
+	if state != validMarkers {
+		return fmt.Errorf("managed markers are missing")
+	}
+	return nil
 }
 
 // replaceFile replaces target through an adjacent temporary file. The returned

@@ -5,9 +5,12 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/saltyorg/sdhm/daemon"
 )
 
 type faultOps struct {
@@ -522,6 +525,478 @@ func TestRestoreTargetCallerCanJoinPrimaryAndRollbackErrors(t *testing.T) {
 	assertFileContent(t, target, []byte("new\n"))
 	assertFileContent(t, backup, []byte("sentinel backup\n"))
 	assertNoTempFiles(t, target, ops.tempPaths)
+}
+
+func TestStorePrepareStates(t *testing.T) {
+	const (
+		section = "DOCKER CONTAINERS"
+		validA  = "127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.2 radarr radarr.saltbox\n# END DOCKER CONTAINERS\n# retained suffix\n"
+		validB  = "127.0.0.1 backup-host\n# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n"
+		corrupt = "127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n"
+	)
+
+	t.Run("valid target and valid backup stay byte-for-byte unchanged", func(t *testing.T) {
+		target, backup := createStoreFiles(t, []byte(validA), []byte(validB))
+		store := NewStore(target, backup, section, "saltbox")
+
+		if err := store.Prepare(t.Context()); err != nil {
+			t.Fatalf("Prepare() error = %v", err)
+		}
+		assertFileContent(t, target, []byte(validA))
+		assertFileContent(t, backup, []byte(validB))
+	})
+
+	t.Run("valid target seeds a missing backup", func(t *testing.T) {
+		target, backup := createStoreFiles(t, []byte(validA), nil)
+		store := NewStore(target, backup, section, "saltbox")
+
+		if err := store.Prepare(t.Context()); err != nil {
+			t.Fatalf("Prepare() error = %v", err)
+		}
+		assertFileContent(t, target, []byte(validA))
+		assertFileContent(t, backup, []byte(validA))
+	})
+
+	t.Run("valid target repairs a corrupt backup", func(t *testing.T) {
+		target, backup := createStoreFiles(t, []byte(validA), []byte(corrupt))
+		if err := os.Chmod(backup, 0o600); err != nil {
+			t.Fatalf("chmod backup: %v", err)
+		}
+		store := NewStore(target, backup, section, "saltbox")
+
+		if err := store.Prepare(t.Context()); err != nil {
+			t.Fatalf("Prepare() error = %v", err)
+		}
+		assertFileContent(t, target, []byte(validA))
+		assertFileContent(t, backup, []byte(validA))
+		assertFileMode(t, backup, 0o600)
+	})
+
+	t.Run("no markers appends an empty managed section and backs up the valid result", func(t *testing.T) {
+		original := []byte("127.0.0.1 localhost\n# user suffix without newline")
+		want := []byte("127.0.0.1 localhost\n# user suffix without newline\n# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n")
+		target, backup := createStoreFiles(t, original, []byte(corrupt))
+		if err := os.Chmod(target, 0o640); err != nil {
+			t.Fatalf("chmod target: %v", err)
+		}
+		store := NewStore(target, backup, section, "saltbox")
+
+		if err := store.Prepare(t.Context()); err != nil {
+			t.Fatalf("Prepare() error = %v", err)
+		}
+		assertFileContent(t, target, want)
+		assertFileContent(t, backup, want)
+		assertFileMode(t, target, 0o640)
+	})
+
+	t.Run("corrupt target restores a valid backup without changing the backup", func(t *testing.T) {
+		target, backup := createStoreFiles(t, []byte(corrupt), []byte(validB))
+		if err := os.Chmod(target, 0o600); err != nil {
+			t.Fatalf("chmod target: %v", err)
+		}
+		if err := os.Chmod(backup, 0o640); err != nil {
+			t.Fatalf("chmod backup: %v", err)
+		}
+		store := NewStore(target, backup, section, "saltbox")
+
+		if err := store.Prepare(t.Context()); err != nil {
+			t.Fatalf("Prepare() error = %v", err)
+		}
+		assertFileContent(t, target, []byte(validB))
+		assertFileMode(t, target, 0o600)
+		assertFileContent(t, backup, []byte(validB))
+		assertFileMode(t, backup, 0o640)
+	})
+
+	t.Run("corrupt target and invalid backup fail without mutation", func(t *testing.T) {
+		target, backup := createStoreFiles(t, []byte(corrupt), []byte("127.0.0.1 backup-without-markers\n"))
+		store := NewStore(target, backup, section, "saltbox")
+
+		if err := store.Prepare(t.Context()); err == nil {
+			t.Fatal("Prepare() error = nil, want invalid recovery error")
+		}
+		assertFileContent(t, target, []byte(corrupt))
+		assertFileContent(t, backup, []byte("127.0.0.1 backup-without-markers\n"))
+	})
+}
+
+func TestStorePrepareRejectsMissingAndNonRegularTargets(t *testing.T) {
+	const section = "DOCKER CONTAINERS"
+
+	t.Run("missing target", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "hosts")
+		backup := filepath.Join(dir, "hosts.backup")
+		store := NewStore(target, backup, section, "saltbox")
+
+		if err := store.Prepare(t.Context()); err == nil {
+			t.Fatal("Prepare() error = nil, want missing-target error")
+		}
+		if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("target was created or cannot be checked: %v", err)
+		}
+	})
+
+	t.Run("symlink target", func(t *testing.T) {
+		dir := t.TempDir()
+		referenced := filepath.Join(dir, "referenced")
+		original := []byte("127.0.0.1 referenced\n")
+		if err := os.WriteFile(referenced, original, 0o644); err != nil {
+			t.Fatalf("write referenced file: %v", err)
+		}
+		target := filepath.Join(dir, "hosts")
+		if err := os.Symlink(referenced, target); err != nil {
+			t.Fatalf("create target symlink: %v", err)
+		}
+		store := NewStore(target, filepath.Join(dir, "hosts.backup"), section, "saltbox")
+
+		if err := store.Prepare(t.Context()); err == nil {
+			t.Fatal("Prepare() error = nil, want symlink-target error")
+		}
+		assertFileContent(t, referenced, original)
+		info, err := os.Lstat(target)
+		if err != nil {
+			t.Fatalf("lstat target: %v", err)
+		}
+		if info.Mode()&fs.ModeSymlink == 0 {
+			t.Fatalf("target mode = %v, want symlink", info.Mode())
+		}
+	})
+
+	t.Run("directory target", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "hosts")
+		if err := os.Mkdir(target, 0o755); err != nil {
+			t.Fatalf("create target directory: %v", err)
+		}
+		sentinel := filepath.Join(target, "sentinel")
+		if err := os.WriteFile(sentinel, []byte("unchanged\n"), 0o644); err != nil {
+			t.Fatalf("write sentinel: %v", err)
+		}
+		store := NewStore(target, filepath.Join(dir, "hosts.backup"), section, "saltbox")
+
+		if err := store.Prepare(t.Context()); err == nil {
+			t.Fatal("Prepare() error = nil, want directory-target error")
+		}
+		assertFileContent(t, sentinel, []byte("unchanged\n"))
+	})
+}
+
+func TestStoreApplyNoChangeLeavesBackupUntouched(t *testing.T) {
+	current := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.2 radarr radarr.saltbox\n# END DOCKER CONTAINERS\n# suffix\n")
+	sentinelBackup := []byte("sentinel backup without markers\n")
+	target, backup := createStoreFiles(t, current, sentinelBackup)
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+	endpoints := []daemon.Endpoint{{
+		Network: "saltbox",
+		IP:      netip.MustParseAddr("172.18.0.2"),
+		Aliases: []string{"radarr"},
+	}}
+
+	if err := store.Apply(t.Context(), endpoints); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	assertFileContent(t, target, current)
+	assertFileContent(t, backup, sentinelBackup)
+}
+
+func TestStoreApplyUsesConfiguredDefaultAcrossNetworks(t *testing.T) {
+	const old = "127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n10.0.0.1 old old.saltbox\n# END DOCKER CONTAINERS\n# unmanaged suffix\n"
+	endpoints := []daemon.Endpoint{
+		{
+			Network: "backend",
+			IP:      netip.MustParseAddr("172.20.0.2"),
+			Aliases: []string{"radarr"},
+		},
+		{
+			Network: "saltbox",
+			IP:      netip.MustParseAddr("172.18.0.2"),
+			Aliases: []string{"radarr"},
+		},
+	}
+
+	t.Run("saltbox default gets the bare alias", func(t *testing.T) {
+		target, backup := createStoreFiles(t, []byte(old), []byte("old backup sentinel\n"))
+		store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+
+		if err := store.Apply(t.Context(), endpoints); err != nil {
+			t.Fatalf("Apply() error = %v", err)
+		}
+		want := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.2 radarr radarr.saltbox\n172.20.0.2 radarr.backend\n# END DOCKER CONTAINERS\n# unmanaged suffix\n")
+		assertFileContent(t, target, want)
+		assertFileContent(t, backup, []byte(old))
+	})
+
+	t.Run("secondary default moves the bare alias", func(t *testing.T) {
+		target, backup := createStoreFiles(t, []byte(old), nil)
+		store := NewStore(target, backup, "DOCKER CONTAINERS", "backend")
+
+		if err := store.Apply(t.Context(), endpoints); err != nil {
+			t.Fatalf("Apply() error = %v", err)
+		}
+		want := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.20.0.2 radarr radarr.backend\n172.18.0.2 radarr.saltbox\n# END DOCKER CONTAINERS\n# unmanaged suffix\n")
+		assertFileContent(t, target, want)
+		assertFileContent(t, backup, []byte(old))
+	})
+}
+
+func TestStoreApplyValidationAndBackupFailuresLeaveTargetUnchanged(t *testing.T) {
+	const old = "127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n"
+
+	t.Run("renderer rejects an empty default network before mutation", func(t *testing.T) {
+		sentinelBackup := []byte("sentinel backup\n")
+		target, backup := createStoreFiles(t, []byte(old), sentinelBackup)
+		store := NewStore(target, backup, "DOCKER CONTAINERS", "")
+		endpoints := []daemon.Endpoint{{
+			Network: "saltbox",
+			IP:      netip.MustParseAddr("172.18.0.2"),
+			Aliases: []string{"radarr"},
+		}}
+
+		if err := store.Apply(t.Context(), endpoints); err == nil {
+			t.Fatal("Apply() error = nil, want default-network validation error")
+		}
+		assertFileContent(t, target, []byte(old))
+		assertFileContent(t, backup, sentinelBackup)
+	})
+
+	t.Run("renderer rejects endpoint data before mutation", func(t *testing.T) {
+		sentinelBackup := []byte("sentinel backup\n")
+		target, backup := createStoreFiles(t, []byte(old), sentinelBackup)
+		store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+		endpoints := []daemon.Endpoint{{
+			Network: "saltbox",
+			IP:      netip.MustParseAddr("172.18.0.2"),
+			Aliases: []string{"bad alias"},
+		}}
+
+		if err := store.Apply(t.Context(), endpoints); err == nil {
+			t.Fatal("Apply() error = nil, want endpoint validation error")
+		}
+		assertFileContent(t, target, []byte(old))
+		assertFileContent(t, backup, sentinelBackup)
+	})
+
+	t.Run("backup write failure", func(t *testing.T) {
+		sentinelBackup := []byte("sentinel backup\n")
+		target, backup := createStoreFiles(t, []byte(old), sentinelBackup)
+		ops := newFaultOps()
+		ops.failAt["write"] = 1
+		store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+		store.ops = ops
+		endpoints := []daemon.Endpoint{{
+			Network: "saltbox",
+			IP:      netip.MustParseAddr("172.18.0.2"),
+			Aliases: []string{"radarr"},
+		}}
+
+		err := store.Apply(t.Context(), endpoints)
+		if !errors.Is(err, ops.failErr["write"]) {
+			t.Fatalf("Apply() error = %v, want backup write sentinel", err)
+		}
+		assertFileContent(t, target, []byte(old))
+		assertFileContent(t, backup, sentinelBackup)
+	})
+
+	t.Run("corrupt current target never overwrites a valid backup", func(t *testing.T) {
+		corrupt := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n")
+		validBackup := []byte(old)
+		target, backup := createStoreFiles(t, corrupt, validBackup)
+		store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+
+		if err := store.Apply(t.Context(), nil); err == nil {
+			t.Fatal("Apply() error = nil, want corrupt-target error")
+		}
+		assertFileContent(t, target, corrupt)
+		assertFileContent(t, backup, validBackup)
+	})
+}
+
+func TestStoreApplyLateTargetFailureRollsBackOnlyTarget(t *testing.T) {
+	old := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n10.0.0.1 old old.saltbox\n# END DOCKER CONTAINERS\n")
+	target, backup := createStoreFiles(t, old, []byte("backup sentinel\n"))
+	ops := newFaultOps()
+	ops.failAt["dir_sync"] = 2
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+	store.ops = ops
+	endpoints := []daemon.Endpoint{{
+		Network: "saltbox",
+		IP:      netip.MustParseAddr("172.18.0.2"),
+		Aliases: []string{"radarr"},
+	}}
+
+	err := store.Apply(t.Context(), endpoints)
+	if !errors.Is(err, ops.failErr["dir_sync"]) {
+		t.Fatalf("Apply() error = %v, want target dir-sync sentinel", err)
+	}
+	assertFileContent(t, target, old)
+	assertFileContent(t, backup, old)
+	if got := ops.calls["rename"]; got != 3 {
+		t.Fatalf("rename calls = %d, want backup, target, and target-only rollback", got)
+	}
+}
+
+func TestStoreApplyJoinsPrimaryAndRollbackFailures(t *testing.T) {
+	old := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n10.0.0.1 old old.saltbox\n# END DOCKER CONTAINERS\n")
+	target, backup := createStoreFiles(t, old, []byte("backup sentinel\n"))
+	ops := newFaultOps()
+	primarySentinel := errors.New("target durability sentinel")
+	rollbackSentinel := errors.New("rollback rename sentinel")
+	ops.failErr["dir_sync"] = primarySentinel
+	ops.failErr["rename"] = rollbackSentinel
+	ops.failAt["dir_sync"] = 2
+	ops.failAt["rename"] = 3
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+	store.ops = ops
+	endpoints := []daemon.Endpoint{{
+		Network: "saltbox",
+		IP:      netip.MustParseAddr("172.18.0.2"),
+		Aliases: []string{"radarr"},
+	}}
+
+	err := store.Apply(t.Context(), endpoints)
+	if !errors.Is(err, primarySentinel) {
+		t.Errorf("Apply() error = %v, want primary sentinel", err)
+	}
+	if !errors.Is(err, rollbackSentinel) {
+		t.Errorf("Apply() error = %v, want rollback sentinel", err)
+	}
+	assertFileContent(t, backup, old)
+	wantTarget := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.2 radarr radarr.saltbox\n# END DOCKER CONTAINERS\n")
+	assertFileContent(t, target, wantTarget)
+}
+
+func TestStoreRegenerateCreatesMissingTargetAndBackup(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "hosts")
+	backup := filepath.Join(dir, "hosts.backup")
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "")
+	store.hostname = func() (string, error) { return "saltbox-host", nil }
+
+	if err := store.Regenerate(t.Context()); err != nil {
+		t.Fatalf("Regenerate() error = %v", err)
+	}
+	want := freshHostsFixture()
+	assertFileContent(t, target, want)
+	assertFileContent(t, backup, want)
+	assertFileMode(t, target, 0o644)
+	assertFileMode(t, backup, 0o644)
+}
+
+func TestStoreRegenerateBacksUpValidPriorTarget(t *testing.T) {
+	prior := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.2 old old.saltbox\n# END DOCKER CONTAINERS\n# retained suffix\n")
+	oldBackup := []byte("127.0.0.1 older\n# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n")
+	target, backup := createStoreFiles(t, prior, oldBackup)
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "")
+	store.hostname = func() (string, error) { return "saltbox-host", nil }
+
+	if err := store.Regenerate(t.Context()); err != nil {
+		t.Fatalf("Regenerate() error = %v", err)
+	}
+	assertFileContent(t, target, freshHostsFixture())
+	assertFileContent(t, backup, prior)
+}
+
+func TestStoreRegeneratePreservesValidBackupWhenPriorTargetIsCorrupt(t *testing.T) {
+	corrupt := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n")
+	validBackup := []byte("127.0.0.1 recovery\n# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n")
+	target, backup := createStoreFiles(t, corrupt, validBackup)
+	if err := os.Chmod(backup, 0o600); err != nil {
+		t.Fatalf("chmod backup: %v", err)
+	}
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "")
+	store.hostname = func() (string, error) { return "saltbox-host", nil }
+
+	if err := store.Regenerate(t.Context()); err != nil {
+		t.Fatalf("Regenerate() error = %v", err)
+	}
+	assertFileContent(t, target, freshHostsFixture())
+	assertFileContent(t, backup, validBackup)
+	assertFileMode(t, backup, 0o600)
+}
+
+func TestStoreRegenerateRepairsInvalidBackupAfterCorruptTarget(t *testing.T) {
+	corruptTarget := []byte("127.0.0.1 localhost\n# END DOCKER CONTAINERS\n")
+	invalidBackup := []byte("127.0.0.1 backup without markers\n")
+	target, backup := createStoreFiles(t, corruptTarget, invalidBackup)
+	if err := os.Chmod(target, 0o640); err != nil {
+		t.Fatalf("chmod target: %v", err)
+	}
+	if err := os.Chmod(backup, 0o600); err != nil {
+		t.Fatalf("chmod backup: %v", err)
+	}
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "")
+	store.hostname = func() (string, error) { return "saltbox-host", nil }
+
+	if err := store.Regenerate(t.Context()); err != nil {
+		t.Fatalf("Regenerate() error = %v", err)
+	}
+	want := freshHostsFixture()
+	assertFileContent(t, target, want)
+	assertFileContent(t, backup, want)
+	assertFileMode(t, target, 0o640)
+	assertFileMode(t, backup, 0o600)
+}
+
+func TestStoreRegenerateHostnameFailureDoesNotMutateFiles(t *testing.T) {
+	prior := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n")
+	oldBackup := []byte("backup sentinel\n")
+	target, backup := createStoreFiles(t, prior, oldBackup)
+	hostnameSentinel := errors.New("hostname sentinel")
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "")
+	store.hostname = func() (string, error) { return "", hostnameSentinel }
+
+	err := store.Regenerate(t.Context())
+	if !errors.Is(err, hostnameSentinel) {
+		t.Fatalf("Regenerate() error = %v, want hostname sentinel", err)
+	}
+	assertFileContent(t, target, prior)
+	assertFileContent(t, backup, oldBackup)
+}
+
+func freshHostsFixture() []byte {
+	return []byte("127.0.0.1\tlocalhost\n" +
+		"127.0.1.1\tsaltbox-host\n" +
+		"\n" +
+		"# The following lines are desirable for IPv6 capable hosts\n" +
+		"::1\tip6-localhost ip6-loopback\n" +
+		"fe00::0\tip6-localnet\n" +
+		"ff00::0\tip6-mcastprefix\n" +
+		"ff02::1\tip6-allnodes\n" +
+		"ff02::2\tip6-allrouters\n" +
+		"ff02::3\tip6-allhosts\n" +
+		"\n" +
+		"# BEGIN DOCKER CONTAINERS\n" +
+		"# END DOCKER CONTAINERS\n")
+}
+
+func createStoreFiles(t *testing.T, targetData, backupData []byte) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	target := filepath.Join(dir, "hosts")
+	backup := filepath.Join(dir, "hosts.backup")
+	if targetData != nil {
+		if err := os.WriteFile(target, targetData, 0o644); err != nil {
+			t.Fatalf("write target: %v", err)
+		}
+	}
+	if backupData != nil {
+		if err := os.WriteFile(backup, backupData, 0o644); err != nil {
+			t.Fatalf("write backup: %v", err)
+		}
+	}
+	return target, backup
+}
+
+func assertFileMode(t *testing.T, path string, want fs.FileMode) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("mode of %s = %04o, want %04o", path, got, want)
+	}
 }
 
 func createTarget(t *testing.T, content string, mode fs.FileMode) (string, fileMetadata) {
