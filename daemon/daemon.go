@@ -134,6 +134,9 @@ func (d *Daemon) Run(parent context.Context) error {
 	}
 
 	initialReconcileErr := d.reconcile(ctx)
+	if runErr, captured, stop := d.startupStop(parent); stop {
+		return finish(runErr, captured)
+	}
 	if parent.Err() == nil && ctx.Err() == nil {
 		d.tracker.CompleteInitialization()
 	}

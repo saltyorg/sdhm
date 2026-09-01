@@ -2,12 +2,14 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -393,10 +395,9 @@ func TestRunSuccessfulStartupUsesExactOrderAndTimeouts(t *testing.T) {
 	assertDeadlineBetween(t, shutdownContexts[0], started.Add(shutdownTimeout), finished.Add(shutdownTimeout))
 }
 
-func TestRunReadinessWaitsForInitialReconciliation(t *testing.T) {
+func TestRunRealHealthListenerWaitsForInitialReconciliation(t *testing.T) {
 	log := &operationLog{}
 	tracker := health.NewTracker()
-	startReady := make(chan bool, 1)
 	prepareStarted := make(chan struct{})
 	releasePrepare := make(chan struct{})
 	snapshotStarted := make(chan struct{})
@@ -439,27 +440,25 @@ func TestRunReadinessWaitsForInitialReconciliation(t *testing.T) {
 			}
 		},
 	}
-	server := newOrderedHealthServer(log)
-	server.onStart = func() { startReady <- tracker.Snapshot().Ready }
+	server := health.NewServer("127.0.0.1:0", health.NewHandler(tracker))
 	ctx, cancel := context.WithCancel(t.Context())
 	daemon := mustNewDaemon(t, validConfig(), source, store, tracker, server)
 	result := make(chan error, 1)
 	go func() { result <- daemon.Run(ctx) }()
 
-	if <-startReady {
-		t.Fatal("tracker was ready when the health listener started")
-	}
 	<-prepareStarted
-	assertReadiness(t, tracker, false)
+	healthURL := "http://" + server.Addr().String()
+	client := &http.Client{Timeout: time.Second}
+	assertInitializingHealth(t, client, healthURL, "hosts preparation")
 	close(releasePrepare)
 	<-snapshotStarted
-	assertReadiness(t, tracker, false)
+	assertInitializingHealth(t, client, healthURL, "Docker snapshot")
 	close(releaseSnapshot)
 	<-applyStarted
-	assertReadiness(t, tracker, false)
+	assertInitializingHealth(t, client, healthURL, "hosts apply")
 	close(releaseApply)
 	<-loopStarted
-	assertReadiness(t, tracker, true)
+	assertReadyHealth(t, client, healthURL)
 
 	cancel()
 	if err := <-result; err != nil {
@@ -539,6 +538,36 @@ func TestRunCancellationDuringInitialReconciliationDoesNotMarkReady(t *testing.T
 	cancel()
 	if err := <-result; err != nil {
 		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	assertReadiness(t, tracker, false)
+}
+
+func TestRunHealthCompletionDuringInitialReconciliationDoesNotMarkReady(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+
+	log := &operationLog{}
+	serveErr := errors.New("serve sentinel")
+	server := newOrderedHealthServer(log)
+	store := &orderedStore{
+		log: log,
+		onApply: func(context.Context) {
+			server.finish(serveErr)
+		},
+	}
+	tracker := health.NewTracker()
+	daemon := mustNewDaemon(
+		t,
+		validConfig(),
+		&orderedSource{log: log},
+		store,
+		tracker,
+		server,
+	)
+
+	err := daemon.Run(t.Context())
+	if !errors.Is(err, serveErr) {
+		t.Fatalf("Run() error = %v, want wrapped %v", err, serveErr)
 	}
 	assertReadiness(t, tracker, false)
 }
@@ -1087,6 +1116,56 @@ func assertReadiness(t *testing.T, tracker *health.Tracker, want bool) {
 	if got := tracker.Snapshot().Ready; got != want {
 		t.Fatalf("health readiness = %t, want %t", got, want)
 	}
+}
+
+type observedHealthResponse struct {
+	Healthy          bool              `json:"healthy"`
+	Message          string            `json:"message"`
+	ErrorCount       int               `json:"error_count"`
+	Errors           []json.RawMessage `json:"errors"`
+	Reason           string            `json:"reason"`
+	TimeUntilHealthy string            `json:"time_until_healthy"`
+}
+
+func assertInitializingHealth(t *testing.T, client *http.Client, url, stage string) {
+	t.Helper()
+	status, response := fetchHealth(t, client, url)
+	if status != http.StatusServiceUnavailable || response.Healthy {
+		t.Fatalf("health during %s = (%d, %+v), want initializing 503", stage, status, response)
+	}
+	if response.Message != "System initializing" || response.Reason != "initialization has not completed" || response.TimeUntilHealthy != "unknown" {
+		t.Fatalf("health during %s = %+v, want initialization details", stage, response)
+	}
+	if response.ErrorCount != 0 || len(response.Errors) != 0 {
+		t.Fatalf("health during %s has %d diagnostic records, want 0", stage, response.ErrorCount)
+	}
+}
+
+func assertReadyHealth(t *testing.T, client *http.Client, url string) {
+	t.Helper()
+	status, response := fetchHealth(t, client, url)
+	if status != http.StatusOK || !response.Healthy || response.Message != "No errors recorded" {
+		t.Fatalf("health after initial reconciliation = (%d, %+v), want ready 200", status, response)
+	}
+}
+
+func fetchHealth(t *testing.T, client *http.Client, url string) (int, observedHealthResponse) {
+	t.Helper()
+	response, err := client.Get(url)
+	if err != nil {
+		t.Fatalf("GET health endpoint: %v", err)
+	}
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			t.Errorf("close health response: %v", err)
+		}
+	}()
+
+	var observed observedHealthResponse
+	if err := json.NewDecoder(response.Body).Decode(&observed); err != nil {
+		t.Fatalf("decode health response: %v", err)
+	}
+	return response.StatusCode, observed
 }
 
 func assertNewestHealthMessage(t *testing.T, tracker *health.Tracker, want string) {
