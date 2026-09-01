@@ -38,7 +38,7 @@ type fileOps interface {
 type osFileOps struct{}
 
 func (osFileOps) OpenReadNoFollow(path string) (readHandle, error) {
-	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 }
 
 func (osFileOps) CreateTemp(dir, pattern string) (syncFile, error) {

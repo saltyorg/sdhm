@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -354,6 +355,47 @@ func TestReadOptionalRegularFileJoinsReadAndCloseFailures(t *testing.T) {
 		if !errors.Is(err, ops.failErr[operation]) {
 			t.Errorf("readOptionalRegularFile() error = %v, want joined %s error", err, operation)
 		}
+	}
+}
+
+func TestReadOptionalRegularFileRejectsFIFOWithoutBlocking(t *testing.T) {
+	dir := t.TempDir()
+	fifoPath := filepath.Join(dir, "hosts.fifo")
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		t.Fatalf("create FIFO: %v", err)
+	}
+	store := newStore(osFileOps{})
+	result := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_, _, _, err := store.readOptionalRegularFile(fifoPath)
+		result <- err
+	}()
+	<-started
+
+	const promptLimit = time.Second
+	timer := time.NewTimer(promptLimit)
+	defer timer.Stop()
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "is not a regular file") {
+			t.Fatalf("readOptionalRegularFile() error = %v, want non-regular-file error", err)
+		}
+	case <-timer.C:
+		release, err := os.OpenFile(fifoPath, os.O_RDWR|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+		if err != nil {
+			t.Fatalf("open test-only FIFO release handle: %v", err)
+		}
+		readErr := <-result
+		closeErr := release.Close()
+		if closeErr != nil {
+			t.Errorf("close test-only FIFO release handle: %v", closeErr)
+		}
+		if readErr == nil || !strings.Contains(readErr.Error(), "is not a regular file") {
+			t.Errorf("released readOptionalRegularFile() error = %v, want non-regular-file error", readErr)
+		}
+		t.Fatalf("readOptionalRegularFile() blocked opening a FIFO without a writer for %s", promptLimit)
 	}
 }
 
