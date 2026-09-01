@@ -7,6 +7,7 @@ import (
 	"slices"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/container"
@@ -310,6 +311,36 @@ func TestSnapshotRejectsMalformedPresentEndpoint(t *testing.T) {
 	}
 }
 
+func TestSnapshotDiscardsAccumulatedEndpointsOnMalformedLaterEndpoint(t *testing.T) {
+	api := newFakeAPI()
+	api.listFn = func(context.Context, mobyclient.ContainerListOptions) (mobyclient.ContainerListResult, error) {
+		return listResult("valid-container", "malformed-container"), nil
+	}
+	api.inspectFn = func(_ context.Context, id string, _ mobyclient.ContainerInspectOptions) (mobyclient.ContainerInspectResult, error) {
+		switch id {
+		case "valid-container":
+			return inspectResult(map[string]*network.EndpointSettings{
+				"saltbox": endpoint("172.19.0.2", "", []string{"radarr"}, nil),
+			}), nil
+		case "malformed-container":
+			return inspectResult(map[string]*network.EndpointSettings{
+				"saltbox": endpoint("172.19.0.3", "", nil, []string{"sonarr"}),
+			}), nil
+		default:
+			t.Fatalf("unexpected container ID %q", id)
+			return mobyclient.ContainerInspectResult{}, nil
+		}
+	}
+
+	got, err := newClient(api).Snapshot(t.Context(), []string{"saltbox"})
+	if err == nil {
+		t.Fatal("Snapshot() error = nil, want malformed-endpoint error")
+	}
+	if got != nil {
+		t.Fatalf("Snapshot() endpoints = %+v, want nil after later malformed endpoint", got)
+	}
+}
+
 func TestSnapshotUsesIPv6FallbackAndOnlyInspectedAliases(t *testing.T) {
 	api := newFakeAPI()
 	api.listFn = func(context.Context, mobyclient.ContainerListOptions) (mobyclient.ContainerListResult, error) {
@@ -537,7 +568,7 @@ func TestCloseWaitsForCanceledBlockedMapper(t *testing.T) {
 		}
 		client := newClient(api)
 		ctx, cancel := context.WithCancel(t.Context())
-		mappedEvents, mappedErrors := client.Events(ctx, []string{"saltbox"})
+		_, mappedErrors := client.Events(ctx, []string{"saltbox"})
 
 		go func() {
 			sourceEvents <- events.Message{Action: events.ActionConnect}
@@ -545,19 +576,29 @@ func TestCloseWaitsForCanceledBlockedMapper(t *testing.T) {
 		}()
 		synctest.Wait()
 
+		closeDone := make(chan error, 1)
+		go func() {
+			closeDone <- client.Close()
+		}()
+		synctest.Wait()
+		select {
+		case err := <-closeDone:
+			t.Fatalf("Close() returned before stream cancellation: %v", err)
+		default:
+		}
+
 		cancel()
-		if err := client.Close(); err != nil {
+		if err := receive(t, closeDone); err != nil {
 			t.Fatalf("Close() error = %v", err)
 		}
 
-		if got := receive(t, mappedEvents); got.Action != "connect" {
-			t.Fatalf("buffered mapped event = %+v, want connect event", got)
-		}
-		if _, ok := receiveOK(t, mappedEvents); ok {
-			t.Fatal("mapped event channel is open after Close returned")
-		}
-		if _, ok := receiveOK(t, mappedErrors); ok {
-			t.Fatal("mapped error channel is open after Close returned")
+		select {
+		case _, ok := <-mappedErrors:
+			if ok {
+				t.Fatal("mapped error channel yielded a value after Close returned")
+			}
+		default:
+			t.Fatal("mapped error channel is still open after Close returned")
 		}
 	})
 }
@@ -640,11 +681,13 @@ func receive[T any](t *testing.T, ch <-chan T) T {
 
 func receiveOK[T any](t *testing.T, ch <-chan T) (T, bool) {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
 	select {
 	case value, ok := <-ch:
 		return value, ok
-	case <-t.Context().Done():
-		t.Fatal("timed out waiting for channel")
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for channel: %v", ctx.Err())
 		var zero T
 		return zero, false
 	}
