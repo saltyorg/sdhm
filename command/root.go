@@ -32,14 +32,24 @@ type regenerateOptions struct {
 func NewRoot(version string, run RunFunc, regenerate RegenerateFunc) *cobra.Command {
 	options := rootOptions{}
 	root := &cobra.Command{
-		Use:           "sdhm",
-		Short:         "Automatically updates /etc/hosts with Docker container hostnames",
+		Use:   "sdhm",
+		Short: "Automatically updates /etc/hosts with Docker container hostnames",
+		Long: `A daemon that monitors Docker network events and automatically updates
+/etc/hosts with container hostnames on a specified network.
+
+Features:
+  - Monitors Docker network events (connect/disconnect)
+  - Updates /etc/hosts with debounced event handling
+  - Periodic validation to ensure sync
+  - Health check endpoint for monitoring
+
+Use 'sdhm regenerate' to reset a corrupted hosts file.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Version:       version,
 		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := options.config()
+			cfg, err := options.config(cmd.Flags().Changed("default-network"))
 			if err != nil {
 				return err
 			}
@@ -73,7 +83,14 @@ func newRegenerateCommand(regenerate RegenerateFunc) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "regenerate",
 		Short: "Regenerate the hosts file with fresh content",
-		Args:  cobra.NoArgs,
+		Long: `Regenerates the hosts file with Ubuntu Server defaults and an empty managed section.
+This is useful for resetting a corrupted hosts file.
+
+The generated file includes:
+  - Standard localhost entries (127.0.0.1, 127.0.1.1)
+  - IPv6 entries (ip6-localhost, ip6-loopback, etc.)
+  - Empty managed section markers for Docker containers`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := options.config()
 			if err != nil {
@@ -92,7 +109,10 @@ func newRegenerateCommand(regenerate RegenerateFunc) *cobra.Command {
 	return cmd
 }
 
-func (o rootOptions) config() (Config, error) {
+func (o rootOptions) config(defaultNetworkSet bool) (Config, error) {
+	if defaultNetworkSet && strings.TrimSpace(o.defaultNetwork) == "" {
+		return Config{}, errors.New("default network must be non-empty when explicitly set")
+	}
 	networks, defaultNetwork, err := ParseNetworks(o.networks, o.defaultNetwork)
 	if err != nil {
 		return Config{}, err

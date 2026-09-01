@@ -180,3 +180,39 @@ func TestConfigValidateAcceptsEqualDebounceBounds(t *testing.T) {
 		t.Fatalf("Config.Validate() with equal debounce bounds error = %v", err)
 	}
 }
+
+func TestConfigValidateHealthAddressLiterals(t *testing.T) {
+	tests := []struct {
+		name    string
+		address string
+		wantErr bool
+	}{
+		{name: "IPv4 loopback", address: "127.0.0.1"},
+		{name: "IPv4 unspecified", address: "0.0.0.0"},
+		{name: "IPv6 loopback", address: "::1"},
+		{name: "not an address", address: "bad address", wantErr: true},
+		{name: "address with port", address: "127.0.0.1:8080", wantErr: true},
+		{name: "malformed IPv6", address: "2001:db8:::1", wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{
+				Networks:         []string{"saltbox"},
+				DefaultNetwork:   "saltbox",
+				HostsFile:        "/etc/hosts",
+				BackupFile:       "/etc/hosts.backup",
+				SectionName:      "DOCKER CONTAINERS",
+				PeriodicInterval: time.Minute,
+				DebounceDelay:    time.Second,
+				MaxDebounceDelay: time.Second,
+				HealthAddr:       test.address,
+				HealthPort:       8080,
+			}
+			err := cfg.Validate()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Config.Validate() health address %q error = %v, wantErr %v", test.address, err, test.wantErr)
+			}
+		})
+	}
+}

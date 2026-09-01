@@ -32,19 +32,19 @@ func TestNewRootBuildsValidatedRuntimeConfig(t *testing.T) {
 			},
 		},
 		{
-			name: "short comma-separated networks",
-			args: []string{"-n", "saltbox,backend"},
+			name: "preserved short runtime flags",
+			args: []string{"-n", "saltbox,backend", "-i", "30s", "-p", "8090"},
 			want: Config{
 				Networks:         []string{"saltbox", "backend"},
 				DefaultNetwork:   "saltbox",
 				HostsFile:        "/etc/hosts",
 				BackupFile:       "/etc/hosts.backup",
 				SectionName:      "DOCKER CONTAINERS",
-				PeriodicInterval: 5 * time.Minute,
+				PeriodicInterval: 30 * time.Second,
 				DebounceDelay:    time.Second,
 				MaxDebounceDelay: 5 * time.Second,
 				HealthAddr:       "127.0.0.1",
-				HealthPort:       8080,
+				HealthPort:       8090,
 			},
 		},
 		{
@@ -151,8 +151,14 @@ func TestNewRootBuildsValidatedRuntimeConfig(t *testing.T) {
 }
 
 func TestNewRootAcceptsHistoricalSaltboxInvocations(t *testing.T) {
-	for _, port := range []string{"8090", "8190"} {
-		t.Run("health port "+port, func(t *testing.T) {
+	for _, test := range []struct {
+		portArg  string
+		wantPort int
+	}{
+		{portArg: "8090", wantPort: 8090},
+		{portArg: "8190", wantPort: 8190},
+	} {
+		t.Run("health port "+test.portArg, func(t *testing.T) {
 			var got Config
 			run := func(_ context.Context, cfg Config) error {
 				got = cfg
@@ -161,7 +167,7 @@ func TestNewRootAcceptsHistoricalSaltboxInvocations(t *testing.T) {
 			result, _, stderr := executeRoot(t, t.Context(), []string{
 				"--networks", "saltbox,backend",
 				"--interval", "5m",
-				"--health-port", port,
+				"--health-port", test.portArg,
 			}, run, nil)
 			if result.err != nil {
 				t.Fatalf("historical ExecuteContext() error = %v", result.err)
@@ -175,8 +181,38 @@ func TestNewRootAcceptsHistoricalSaltboxInvocations(t *testing.T) {
 			if got.PeriodicInterval != 5*time.Minute {
 				t.Errorf("interval = %v, want 5m", got.PeriodicInterval)
 			}
+			if got.HealthPort != test.wantPort {
+				t.Errorf("health port = %d, want %d", got.HealthPort, test.wantPort)
+			}
 			if stderr != "" {
 				t.Errorf("stderr = %q, want empty", stderr)
+			}
+		})
+	}
+}
+
+func TestNewRootRejectsExplicitBlankDefaultNetwork(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+	}{
+		{name: "empty assignment", args: []string{"--default-network="}},
+		{name: "whitespace value", args: []string{"--default-network", "   "}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			called := false
+			result, stdout, stderr := executeRoot(t, t.Context(), test.args, func(context.Context, Config) error {
+				called = true
+				return nil
+			}, nil)
+			if result.err == nil || !strings.Contains(result.err.Error(), "default network") {
+				t.Fatalf("ExecuteContext() error = %v, want non-empty default-network error", result.err)
+			}
+			if called {
+				t.Error("run called for explicitly blank default network")
+			}
+			if stdout != "" || stderr != "" {
+				t.Errorf("output = stdout %q stderr %q, want concise returned error only", stdout, stderr)
 			}
 		})
 	}
@@ -260,6 +296,51 @@ func TestNewRootPinsVersionOutput(t *testing.T) {
 	}
 	if stderr != "" {
 		t.Errorf("stderr = %q, want empty", stderr)
+	}
+}
+
+func TestNewRootPreservesLegacyHelp(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantAll []string
+	}{
+		{
+			name: "root",
+			args: []string{"--help"},
+			wantAll: []string{
+				"A daemon that monitors Docker network events",
+				"Features:",
+				"Periodic validation to ensure sync",
+				"Use 'sdhm regenerate' to reset a corrupted hosts file.",
+			},
+		},
+		{
+			name: "regenerate",
+			args: []string{"regenerate", "--help"},
+			wantAll: []string{
+				"Regenerates the hosts file with Ubuntu Server defaults",
+				"Standard localhost entries",
+				"Empty managed section markers for Docker containers",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, stdout, stderr := executeRoot(t, t.Context(), test.args, nil, nil)
+			if result.err != nil {
+				t.Fatalf("ExecuteContext() error = %v", result.err)
+			}
+			for _, want := range test.wantAll {
+				if !strings.Contains(stdout, want) {
+					t.Errorf("help output missing %q:\n%s", want, stdout)
+				}
+			}
+			if stderr != "" {
+				t.Errorf("stderr = %q, want empty", stderr)
+			}
+		})
 	}
 }
 

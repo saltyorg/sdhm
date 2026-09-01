@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"time"
@@ -96,6 +97,9 @@ func (c Config) Validate() error {
 	}
 	if c.HealthAddr == "" || strings.TrimSpace(c.HealthAddr) != c.HealthAddr {
 		return errors.New("health address must be non-empty and normalized")
+	}
+	if _, err := netip.ParseAddr(c.HealthAddr); err != nil {
+		return fmt.Errorf("health address %q must be a literal IPv4 or IPv6 address: %w", c.HealthAddr, err)
 	}
 	if c.HealthPort < 1 || c.HealthPort > 65535 {
 		return fmt.Errorf("health port %d is outside 1..65535", c.HealthPort)
