@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/saltyorg/sdhm/health"
 )
@@ -128,7 +129,7 @@ func (d *Daemon) Run(parent context.Context) error {
 		return d.cleanup(serverStarted, runErr, captured)
 	}
 
-	runErr, serveErrCaptured := d.loop(ctx, parent)
+	runErr, serveErrCaptured := d.loop(ctx)
 	cancel()
 	return d.cleanup(serverStarted, runErr, serveErrCaptured)
 }
@@ -165,16 +166,13 @@ func (d *Daemon) startupStop(parent context.Context) (error, bool, bool) {
 		if serveErr != nil {
 			return fmt.Errorf("health server stopped: %w", serveErr), true, true
 		}
-		if parent.Err() != nil {
-			return nil, true, true
-		}
 		return errHealthServerStopped, true, true
 	default:
 		return nil, false, false
 	}
 }
 
-func (d *Daemon) loop(ctx, parent context.Context) (error, bool) {
+func (d *Daemon) loop(ctx context.Context) (error, bool) {
 	select {
 	case <-ctx.Done():
 		return nil, false
@@ -182,9 +180,6 @@ func (d *Daemon) loop(ctx, parent context.Context) (error, bool) {
 		serveErr := d.server.Err()
 		if serveErr != nil {
 			return fmt.Errorf("health server stopped: %w", serveErr), true
-		}
-		if parent.Err() != nil {
-			return nil, true
 		}
 		return errHealthServerStopped, true
 	}
@@ -194,19 +189,25 @@ func (d *Daemon) cleanup(serverStarted bool, runErr error, serveErrCaptured bool
 	var shutdownErr error
 	var terminalServeErr error
 	if serverStarted {
+		completedBeforeShutdown := false
+		select {
+		case <-d.server.Done():
+			completedBeforeShutdown = true
+		default:
+		}
+
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), d.timing.shutdownTimeout)
 		if err := d.server.Shutdown(shutdownCtx); err != nil {
 			shutdownErr = fmt.Errorf("shut down health server: %w", err)
 		}
 		cancel()
+		<-d.server.Done()
 
 		if !serveErrCaptured {
-			select {
-			case <-d.server.Done():
-				if err := d.server.Err(); err != nil {
-					terminalServeErr = fmt.Errorf("health server stopped: %w", err)
-				}
-			default:
+			if err := d.server.Err(); err != nil {
+				terminalServeErr = fmt.Errorf("health server stopped: %w", err)
+			} else if completedBeforeShutdown {
+				terminalServeErr = errHealthServerStopped
 			}
 		}
 	}
@@ -225,7 +226,7 @@ func validateConfig(cfg Config) error {
 	seen := make(map[string]struct{}, len(cfg.Networks))
 	defaultFound := false
 	for _, network := range cfg.Networks {
-		if network == "" || strings.TrimSpace(network) != network {
+		if network == "" || strings.TrimSpace(network) != network || strings.IndexFunc(network, invalidNetworkRune) >= 0 {
 			return fmt.Errorf("network %q is not normalized", network)
 		}
 		if _, exists := seen[network]; exists {
@@ -252,6 +253,10 @@ func validateConfig(cfg Config) error {
 		return errors.New("maximum debounce delay must not be less than debounce delay")
 	}
 	return nil
+}
+
+func invalidNetworkRune(r rune) bool {
+	return r == '#' || unicode.IsSpace(r) || unicode.IsControl(r)
 }
 
 func isNil(value any) bool {

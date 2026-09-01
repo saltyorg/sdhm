@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/saltyorg/sdhm/health"
@@ -35,12 +36,14 @@ func (l *operationLog) snapshot() []string {
 type orderedSource struct {
 	log *operationLog
 
-	pingErr     error
-	snapshotErr error
-	closeErr    error
-	endpoints   []Endpoint
-	onPing      func(context.Context)
-	onSnapshot  func(context.Context)
+	pingErr        error
+	snapshotErr    error
+	closeErr       error
+	endpoints      []Endpoint
+	onPing         func(context.Context)
+	onSnapshot     func(context.Context)
+	onClose        func()
+	mutateNetworks func([]string)
 
 	mu               sync.Mutex
 	pingContexts     []context.Context
@@ -65,6 +68,9 @@ func (s *orderedSource) Snapshot(ctx context.Context, networks []string) ([]Endp
 	s.snapshotContexts = append(s.snapshotContexts, ctx)
 	s.snapshotNetworks = append(s.snapshotNetworks, slices.Clone(networks))
 	s.mu.Unlock()
+	if s.mutateNetworks != nil {
+		s.mutateNetworks(networks)
+	}
 	if s.onSnapshot != nil {
 		s.onSnapshot(ctx)
 	}
@@ -80,6 +86,9 @@ func (*orderedSource) Events(context.Context, []string) (<-chan Event, <-chan er
 
 func (s *orderedSource) Close() error {
 	s.log.add("source_close")
+	if s.onClose != nil {
+		s.onClose()
+	}
 	return s.closeErr
 }
 
@@ -139,11 +148,12 @@ type orderedHealthServer struct {
 	log  *operationLog
 	done chan struct{}
 
-	startErr    error
-	shutdownErr error
-	onStart     func()
-	onErr       func()
-	onShutdown  func(context.Context)
+	startErr         error
+	shutdownErr      error
+	finishOnShutdown bool
+	onStart          func()
+	onErr            func()
+	onShutdown       func(context.Context)
 
 	finishOnce sync.Once
 	mu         sync.Mutex
@@ -154,7 +164,7 @@ type orderedHealthServer struct {
 }
 
 func newOrderedHealthServer(log *operationLog) *orderedHealthServer {
-	return &orderedHealthServer{log: log, done: make(chan struct{})}
+	return &orderedHealthServer{log: log, done: make(chan struct{}), finishOnShutdown: true}
 }
 
 func (s *orderedHealthServer) Start() error {
@@ -188,7 +198,9 @@ func (s *orderedHealthServer) Shutdown(ctx context.Context) error {
 	if s.onShutdown != nil {
 		s.onShutdown(ctx)
 	}
-	s.finish(nil)
+	if s.finishOnShutdown {
+		s.finish(nil)
+	}
 	return s.shutdownErr
 }
 
@@ -201,12 +213,6 @@ func (s *orderedHealthServer) finish(err error) {
 		s.mu.Unlock()
 		close(s.done)
 	})
-}
-
-func (s *orderedHealthServer) setTerminalError(err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.err = err
 }
 
 func (s *orderedHealthServer) shutdownCalls() ([]context.Context, []error, int) {
@@ -243,6 +249,11 @@ func TestNewValidatesDependenciesConfigurationAndClonesNetworks(t *testing.T) {
 		{name: "no networks", cfg: configWith(valid, func(cfg *Config) { cfg.Networks = nil }), source: source, store: store, tracker: tracker, server: server, logger: logger},
 		{name: "empty network", cfg: configWith(valid, func(cfg *Config) { cfg.Networks = []string{""} }), source: source, store: store, tracker: tracker, server: server, logger: logger},
 		{name: "untrimmed network", cfg: configWith(valid, func(cfg *Config) { cfg.Networks = []string{" saltbox"} }), source: source, store: store, tracker: tracker, server: server, logger: logger},
+		{name: "internal space in network", cfg: configWith(valid, func(cfg *Config) { cfg.Networks = []string{"salt box"}; cfg.DefaultNetwork = "salt box" }), source: source, store: store, tracker: tracker, server: server, logger: logger},
+		{name: "internal tab in network", cfg: configWith(valid, func(cfg *Config) { cfg.Networks = []string{"salt\tbox"}; cfg.DefaultNetwork = "salt\tbox" }), source: source, store: store, tracker: tracker, server: server, logger: logger},
+		{name: "newline in network", cfg: configWith(valid, func(cfg *Config) { cfg.Networks = []string{"salt\nbox"}; cfg.DefaultNetwork = "salt\nbox" }), source: source, store: store, tracker: tracker, server: server, logger: logger},
+		{name: "control rune in network", cfg: configWith(valid, func(cfg *Config) { cfg.Networks = []string{"salt\x00box"}; cfg.DefaultNetwork = "salt\x00box" }), source: source, store: store, tracker: tracker, server: server, logger: logger},
+		{name: "comment delimiter in network", cfg: configWith(valid, func(cfg *Config) { cfg.Networks = []string{"salt#box"}; cfg.DefaultNetwork = "salt#box" }), source: source, store: store, tracker: tracker, server: server, logger: logger},
 		{name: "duplicate network", cfg: configWith(valid, func(cfg *Config) { cfg.Networks = []string{"saltbox", "saltbox"} }), source: source, store: store, tracker: tracker, server: server, logger: logger},
 		{name: "default absent", cfg: configWith(valid, func(cfg *Config) { cfg.DefaultNetwork = "missing" }), source: source, store: store, tracker: tracker, server: server, logger: logger},
 		{name: "periodic interval not positive", cfg: configWith(valid, func(cfg *Config) { cfg.PeriodicInterval = 0 }), source: source, store: store, tracker: tracker, server: server, logger: logger},
@@ -273,6 +284,40 @@ func TestNewValidatesDependenciesConfigurationAndClonesNetworks(t *testing.T) {
 	}
 }
 
+func TestReconcileProtectsStoredNetworksFromSourceMutation(t *testing.T) {
+	log := &operationLog{}
+	source := &orderedSource{
+		log: log,
+		mutateNetworks: func(networks []string) {
+			networks[0] = "mutated"
+		},
+	}
+	daemon := mustNewDaemon(
+		t,
+		validConfig(),
+		source,
+		&orderedStore{log: log},
+		health.NewTracker(),
+		newOrderedHealthServer(log),
+	)
+
+	if err := daemon.reconcile(t.Context()); err != nil {
+		t.Fatalf("first reconcile() error = %v", err)
+	}
+	if err := daemon.reconcile(t.Context()); err != nil {
+		t.Fatalf("second reconcile() error = %v", err)
+	}
+	_, _, networks := source.calls()
+	if len(networks) != 2 {
+		t.Fatalf("Snapshot() calls = %d, want 2", len(networks))
+	}
+	for i, got := range networks {
+		if !slices.Equal(got, []string{"saltbox", "backend"}) {
+			t.Fatalf("Snapshot() call %d networks = %v, want stored [saltbox backend]", i, got)
+		}
+	}
+}
+
 func TestRunSuccessfulStartupUsesExactOrderAndTimeouts(t *testing.T) {
 	log := &operationLog{}
 	source := &orderedSource{
@@ -285,7 +330,22 @@ func TestRunSuccessfulStartupUsesExactOrderAndTimeouts(t *testing.T) {
 	store := &orderedStore{log: log}
 	server := newOrderedHealthServer(log)
 	ctx, cancel := context.WithCancel(t.Context())
-	store.onApply = func(context.Context) { cancel() }
+	var daemonContext context.Context
+	var applyContextIssue string
+	store.onPrepare = func(ctx context.Context) { daemonContext = ctx }
+	store.onApply = func(ctx context.Context) {
+		switch {
+		case ctx != daemonContext:
+			applyContextIssue = "Apply() did not receive the daemon context used for Prepare()"
+		case ctx.Err() != nil:
+			applyContextIssue = "Apply() received an already-canceled context"
+		default:
+			if _, ok := ctx.Deadline(); ok {
+				applyContextIssue = "Apply() received the deadline-bound snapshot context"
+			}
+		}
+		cancel()
+	}
 	daemon := mustNewDaemon(t, validConfig(), source, store, health.NewTracker(), server)
 
 	started := time.Now()
@@ -293,6 +353,9 @@ func TestRunSuccessfulStartupUsesExactOrderAndTimeouts(t *testing.T) {
 		t.Fatalf("Run() error = %v", err)
 	}
 	finished := time.Now()
+	if applyContextIssue != "" {
+		t.Error(applyContextIssue)
+	}
 
 	assertOperations(t, log, []string{
 		"ping", "health_start", "hosts_prepare", "snapshot", "hosts_apply",
@@ -659,6 +722,48 @@ func TestRunCallerCancellationDoesNotHideConcurrentTerminalServeError(t *testing
 	}
 }
 
+func TestRunPreShutdownNilCompletionIsUnexpected(t *testing.T) {
+	t.Run("Err observation cancels caller", func(t *testing.T) {
+		log := &operationLog{}
+		ctx, cancel := context.WithCancel(t.Context())
+		source := &orderedSource{log: log}
+		server := newOrderedHealthServer(log)
+		server.onErr = cancel
+		store := &orderedStore{log: log, onApply: func(context.Context) { server.finish(nil) }}
+		daemon := mustNewDaemon(t, validConfig(), source, store, health.NewTracker(), server)
+
+		err := daemon.Run(ctx)
+		if !errors.Is(err, errHealthServerStopped) {
+			t.Fatalf("Run() error = %v, want unexpected pre-shutdown completion", err)
+		}
+	})
+
+	t.Run("hosts preparation also fails", func(t *testing.T) {
+		log := &operationLog{}
+		prepareErr := errors.New("prepare sentinel")
+		source := &orderedSource{log: log}
+		server := newOrderedHealthServer(log)
+		store := &orderedStore{
+			log:        log,
+			prepareErr: prepareErr,
+			onPrepare: func(context.Context) {
+				server.finish(nil)
+			},
+		}
+		daemon := mustNewDaemon(t, validConfig(), source, store, health.NewTracker(), server)
+
+		err := daemon.Run(t.Context())
+		for _, wantErr := range []error{prepareErr, errHealthServerStopped} {
+			if !errors.Is(err, wantErr) {
+				t.Errorf("Run() error = %v, want joined %v", err, wantErr)
+			}
+		}
+		assertOperations(t, log, []string{
+			"ping", "health_start", "hosts_prepare", "health_shutdown", "source_close",
+		})
+	})
+}
+
 func TestRunJoinsIndependentStartupAndCleanupErrors(t *testing.T) {
 	log := &operationLog{}
 	prepareErr := errors.New("prepare sentinel")
@@ -666,9 +771,14 @@ func TestRunJoinsIndependentStartupAndCleanupErrors(t *testing.T) {
 	shutdownErr := errors.New("shutdown sentinel")
 	closeErr := errors.New("close sentinel")
 	source := &orderedSource{log: log, closeErr: closeErr}
-	store := &orderedStore{log: log, prepareErr: prepareErr}
 	server := newOrderedHealthServer(log)
-	server.setTerminalError(serveErr)
+	store := &orderedStore{
+		log:        log,
+		prepareErr: prepareErr,
+		onPrepare: func(context.Context) {
+			server.finish(serveErr)
+		},
+	}
 	server.shutdownErr = shutdownErr
 	daemon := mustNewDaemon(t, validConfig(), source, store, health.NewTracker(), server)
 
@@ -710,6 +820,51 @@ func TestRunJoinsUnexpectedServeAndCleanupErrorsWithoutDuplicatingServeError(t *
 	if errCalls != 1 {
 		t.Fatalf("HealthServer.Err() calls = %d, want one terminal read", errCalls)
 	}
+}
+
+func TestRunWaitsForHealthDoneAfterShutdownError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		log := &operationLog{}
+		shutdownErr := errors.New("shutdown sentinel")
+		terminalErr := errors.New("terminal sentinel")
+		startupComplete := make(chan struct{})
+		sourceClosed := make(chan struct{})
+		source := &orderedSource{log: log, onClose: func() { close(sourceClosed) }}
+		store := &orderedStore{log: log, onApply: func(context.Context) { close(startupComplete) }}
+		server := newOrderedHealthServer(log)
+		server.shutdownErr = shutdownErr
+		server.finishOnShutdown = false
+		daemon := mustNewDaemon(t, validConfig(), source, store, health.NewTracker(), server)
+		ctx, cancel := context.WithCancel(t.Context())
+		result := make(chan error, 1)
+		go func() { result <- daemon.Run(ctx) }()
+
+		<-startupComplete
+		cancel()
+		synctest.Wait()
+		select {
+		case err := <-result:
+			t.Fatalf("Run() returned before HealthServer.Done closed: %v", err)
+		default:
+		}
+		select {
+		case <-sourceClosed:
+			t.Fatal("NetworkSource.Close() ran before HealthServer.Done closed")
+		default:
+		}
+
+		server.finish(terminalErr)
+		err := <-result
+		for _, wantErr := range []error{shutdownErr, terminalErr} {
+			if !errors.Is(err, wantErr) {
+				t.Errorf("Run() error = %v, want joined %v", err, wantErr)
+			}
+		}
+		assertOperations(t, log, []string{
+			"ping", "health_start", "hosts_prepare", "snapshot", "hosts_apply",
+			"health_shutdown", "source_close",
+		})
+	})
 }
 
 func validConfig() Config {
