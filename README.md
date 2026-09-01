@@ -176,7 +176,7 @@ sudo journalctl -u sdhm -f
 ## How It Works
 
 1. **Startup**: SDHM pings Docker, binds the health listener, and validates or prepares the managed hosts section before starting background work
-2. **Discovery**: One authoritative list/inspect pass gathers every publishable endpoint on the configured networks. Container-list or non-not-found inspect failures preserve the current hosts file, while endpoints without usable settings, an IP address, or aliases are omitted so restarting containers cannot block healthy updates
+2. **Discovery**: One authoritative list/inspect pass gathers every publishable endpoint on the configured networks. Container-list or non-not-found inspect failures preserve the current hosts file, while endpoints without usable settings, an IP address, or aliases are omitted because they have no valid hosts mapping. In the verified crash-loop case, Docker kept the restarting container listed while clearing its IP, so omission prevents it from blocking healthy updates
 3. **Scheduling**: Network events are debounced, periodic validation requests immediate reconciliation, and failed work retries with bounded backoff
 4. **Hosts File Update**: The complete publishable snapshot replaces one managed section while preserving every byte outside it:
    ```
