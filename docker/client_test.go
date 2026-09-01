@@ -294,7 +294,7 @@ func TestSnapshotSkipsUnpublishableEndpointAndKeepsHealthyContainer(t *testing.T
 		t.Run(tt.name, func(t *testing.T) {
 			api := newFakeAPI()
 			api.listFn = func(context.Context, mobyclient.ContainerListOptions) (mobyclient.ContainerListResult, error) {
-				return listResult("healthy-container", "unpublishable-container"), nil
+				return listResult("unpublishable-container", "healthy-container"), nil
 			}
 			api.inspectFn = func(_ context.Context, id string, _ mobyclient.ContainerInspectOptions) (mobyclient.ContainerInspectResult, error) {
 				switch id {
@@ -325,27 +325,49 @@ func TestSnapshotSkipsUnpublishableEndpointAndKeepsHealthyContainer(t *testing.T
 }
 
 func TestSnapshotSkipsUnpublishableNetworkAndKeepsOtherNetwork(t *testing.T) {
-	api := newFakeAPI()
-	api.listFn = func(context.Context, mobyclient.ContainerListOptions) (mobyclient.ContainerListResult, error) {
-		return listResult("container-1"), nil
-	}
-	api.inspectFn = func(context.Context, string, mobyclient.ContainerInspectOptions) (mobyclient.ContainerInspectResult, error) {
-		return inspectResult(map[string]*network.EndpointSettings{
-			"saltbox": endpoint("", "", []string{"radarr"}, nil),
-			"backend": endpoint("172.20.0.2", "", []string{"radarr"}, nil),
-		}), nil
+	tests := []struct {
+		name     string
+		endpoint *network.EndpointSettings
+	}{
+		{
+			name:     "nil endpoint",
+			endpoint: nil,
+		},
+		{
+			name:     "missing address",
+			endpoint: endpoint("", "", []string{"radarr"}, nil),
+		},
+		{
+			name:     "empty aliases",
+			endpoint: endpoint("172.19.0.2", "", []string{"", ""}, []string{"radarr", "container-id"}),
+		},
 	}
 
-	got, err := newClient(api).Snapshot(t.Context(), []string{"saltbox", "backend"})
-	if err != nil {
-		t.Fatalf("Snapshot() error = %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			api := newFakeAPI()
+			api.listFn = func(context.Context, mobyclient.ContainerListOptions) (mobyclient.ContainerListResult, error) {
+				return listResult("container-1"), nil
+			}
+			api.inspectFn = func(context.Context, string, mobyclient.ContainerInspectOptions) (mobyclient.ContainerInspectResult, error) {
+				return inspectResult(map[string]*network.EndpointSettings{
+					"saltbox": tt.endpoint,
+					"backend": endpoint("172.20.0.2", "", []string{"radarr"}, nil),
+				}), nil
+			}
+
+			got, err := newClient(api).Snapshot(t.Context(), []string{"saltbox", "backend"})
+			if err != nil {
+				t.Fatalf("Snapshot() error = %v", err)
+			}
+			want := []daemon.Endpoint{{
+				Network: "backend",
+				IP:      netip.MustParseAddr("172.20.0.2"),
+				Aliases: []string{"radarr"},
+			}}
+			assertEndpointsEqual(t, got, want)
+		})
 	}
-	want := []daemon.Endpoint{{
-		Network: "backend",
-		IP:      netip.MustParseAddr("172.20.0.2"),
-		Aliases: []string{"radarr"},
-	}}
-	assertEndpointsEqual(t, got, want)
 }
 
 func TestSnapshotUsesIPv6FallbackAndOnlyInspectedAliases(t *testing.T) {
