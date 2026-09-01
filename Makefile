@@ -1,9 +1,5 @@
 # Makefile for sdhm Go project
 
-# Colors for output
-GREEN=\033[0;32m
-NC=\033[0m # No Color
-
 # Go parameters
 GOCMD=go
 GOBUILD=$(GOCMD) build
@@ -16,16 +12,17 @@ GOVET=$(GOCMD) vet
 BINARY_NAME=sdhm
 BINARY_PATH=./cmd/sdhm
 BUILD_DIR=build
-VERSION?=0.0.0.0-dev
+VERSION?=0.0.0-dev
 TEST_PACKAGES ?= ./...
 TEST_FLAGS ?=
 
 # Build flags
 LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
 
-.PHONY: all build clean test test-short test-coverage deps update tidy modernize fmt vet lint help run install uninstall fmt-check tidy-check test-race check
+.PHONY: all build clean test test-short test-coverage deps update tidy fmt vet help run install uninstall fmt-check tidy-check test-race check
 
 # Default target
+## all: Run tests and build the binary
 all: test build
 
 ## build: Build the sdhm binary
@@ -45,16 +42,27 @@ clean:
 test:
 	$(GOTEST) $(TEST_FLAGS) $(TEST_PACKAGES)
 
+## fmt-check: Check that tracked Go files are formatted
 fmt-check:
-	@diff="$$(git ls-files -z '*.go' | xargs -0 gofmt -d)"; \
-	if [ -n "$$diff" ]; then echo "$$diff"; exit 1; fi
+	@diff="$$(git ls-files -z --cached -- '*.go' | \
+		xargs -0 -r sh -c 'for file do \
+			[ ! -e "$$file" ] && continue; \
+			gofmt -d "$$file"; status=$$?; \
+			[ "$$status" -le 1 ] || exit "$$status"; \
+		done' sh)"; \
+	status=$$?; \
+	if [ "$$status" -ne 0 ]; then exit "$$status"; fi; \
+	if [ -n "$$diff" ]; then printf '%s\n' "$$diff"; exit 1; fi
 
+## tidy-check: Check module files without modifying them
 tidy-check:
 	$(GOMOD) tidy -diff
 
+## test-race: Run all tests with the race detector
 test-race:
 	$(GOTEST) -race $(TEST_FLAGS) $(TEST_PACKAGES)
 
+## check: Run formatting, module, race, vet, and build gates
 check: fmt-check tidy-check test-race vet build
 
 ## test-short: Run short tests
@@ -86,12 +94,6 @@ tidy:
 	@echo "Tidying go.mod..."
 	$(GOMOD) tidy
 
-## modernize: Modernize the project (format, vet, update, tidy, and apply latest Go patterns)
-modernize: fmt vet update tidy
-	@echo "$(GREEN)Running Go modernization tool...$(NC)"
-	@$(GOCMD) run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest -fix -test ./... || echo "Note: modernize tool completed (warnings are normal)"
-	@echo "$(GREEN)Project modernized!$(NC)"
-
 ## fmt: Format code
 fmt:
 	@echo "Formatting code..."
@@ -101,15 +103,6 @@ fmt:
 vet:
 	@echo "Running go vet..."
 	$(GOVET) ./...
-
-## lint: Run golangci-lint (requires golangci-lint to be installed)
-lint:
-	@echo "Running golangci-lint..."
-	@if command -v golangci-lint >/dev/null 2>&1; then \
-		golangci-lint run ./...; \
-	else \
-		echo "golangci-lint not installed. Install with: curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $$(go env GOPATH)/bin"; \
-	fi
 
 ## run: Run the application with example interval (requires root for /etc/hosts)
 run:

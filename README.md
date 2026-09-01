@@ -4,19 +4,20 @@ A daemon that automatically updates `/etc/hosts` with Docker container hostnames
 
 ## Features
 
-- **Automatic Host Management**: Monitors Docker network events (connect/disconnect) and updates `/etc/hosts` in real-time
-- **Multi-Network Support**: Monitor multiple Docker networks simultaneously
+- **Authoritative Host Management**: Reconciles complete Docker snapshots into `/etc/hosts` after network events and periodic validation
+- **Multi-Network Support**: Monitors multiple Docker networks in one atomic update, with collision-safe qualified aliases
 - **Debounced Event Handling**: Prevents excessive updates during container churn
 - **Periodic Validation**: Ensures `/etc/hosts` stays in sync with Docker networks
-- **Health Check Endpoint**: Built-in HTTP health check for monitoring and service management
-- **Automatic Recovery**: Recovers from corrupted hosts files using automatic backups
+- **Current-State Health**: Reports active failures and retains bounded diagnostic history without time-based false recovery
+- **Validated Recovery**: Recovers corrupt managed markers only from a valid backup and otherwise fails without overwriting the target
+- **Transactional Updates**: Uses adjacent temporary files, durable atomic replacement, readback validation, and bounded rollback
 - **Configurable Section Management**: Manages a clearly marked section in `/etc/hosts` while preserving other entries
 
 ## Requirements
 
 - Linux system with Docker installed
 - Root access (to modify `/etc/hosts`)
-- Go 1.25.5+ (for building from source)
+- Go 1.27+ (for building from source)
 
 ## Installation
 
@@ -65,6 +66,11 @@ Monitor multiple Docker networks:
 sudo sdhm --networks "bridge,mynetwork,webproxy"
 ```
 
+Choose which monitored network also receives bare aliases:
+```bash
+sudo sdhm --networks "saltbox,backend" --default-network backend
+```
+
 Run with custom validation interval:
 ```bash
 sudo sdhm --interval 10m
@@ -85,6 +91,7 @@ sdhm --hosts-file /tmp/test-hosts --networks bridge
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--networks` | `-n` | `saltbox` | Comma-separated list of Docker networks to monitor |
+| `--default-network` | | Automatic | Monitored network that also receives bare host aliases |
 | `--interval` | `-i` | `5m` | Periodic validation interval (e.g., 30s, 5m, 1h, 1d) |
 | `--health-port` | `-p` | `8080` | Health check HTTP server port |
 | `--health-addr` | | `127.0.0.1` | IP address to bind health check server |
@@ -94,13 +101,15 @@ sdhm --hosts-file /tmp/test-hosts --networks bridge
 | `--debounce-delay` | | `1s` | Debounce delay for event handling |
 | `--debounce-max-delay` | | `5s` | Maximum debounce delay |
 
+### Network and Alias Rules
+
+`--networks/-n` keeps its historical comma-separated syntax. SDHM trims surrounding spaces, ignores empty items, removes duplicates while preserving first occurrence order, and requires at least one network.
+
+The resolved default network receives both `alias` and `alias.<network>` names. Every secondary network receives only `alias.<network>`, preventing bare-name collisions. `--default-network` must name a monitored network. When it is omitted, `saltbox` is preferred if present; otherwise the first configured network becomes the default. Existing startup commands using only `--networks`, `--interval`, and `--health-port` therefore require no new flag.
+
 ### Time Duration Formats
 
-Duration values support the following units:
-- `s` - seconds (e.g., `30s`)
-- `m` - minutes (e.g., `5m`)
-- `h` - hours (e.g., `1h`)
-- `d` - days (e.g., `1d`)
+Interval and debounce values accept positive Go durations, including milliseconds and compound values such as `500ms`, `1m30s`, and `2h15m`. Exact positive integer days such as `1d` or `7d` are also accepted. Zero and negative durations are rejected.
 
 ### Health Check Endpoint
 
@@ -121,6 +130,8 @@ Response:
   "status": "ok"
 }
 ```
+
+The endpoint returns HTTP 200 only when no concern is currently active and HTTP 503 while Docker snapshots, event streaming, hosts updates, or recovery remain failed. A concern clears only after that same operation succeeds; elapsed time alone never marks it recovered. Up to ten historical records remain available for diagnosis, so `error_count` is retained history rather than the number of active concerns. Active records use `unknown` recovery fields, while superseded or recovered records use `0s`.
 
 ## Running as a System Service
 
@@ -162,17 +173,17 @@ sudo journalctl -u sdhm -f
 
 ## How It Works
 
-1. **Monitoring**: SDHM connects to the Docker daemon and listens for network events
-2. **Event Handling**: When containers connect/disconnect from monitored networks, events are debounced to prevent excessive updates
-3. **Hosts File Update**: Container hostnames and IPs are added to a managed section in `/etc/hosts`:
+1. **Startup**: SDHM pings Docker, binds the health listener, and validates or prepares the managed hosts section before starting background work
+2. **Discovery**: One authoritative snapshot inspects all running containers attached to any configured network; a partial or malformed snapshot is never applied
+3. **Scheduling**: Network events are debounced, periodic validation requests immediate reconciliation, and failed work retries with bounded backoff
+4. **Hosts File Update**: The complete snapshot replaces one managed section while preserving every byte outside it:
    ```
    # BEGIN DOCKER CONTAINERS
    172.18.0.2  mycontainer
    172.18.0.3  webserver
    # END DOCKER CONTAINERS
    ```
-4. **Periodic Validation**: Every interval, SDHM validates that `/etc/hosts` matches the current Docker network state
-5. **Backup & Recovery**: Before each update, `/etc/hosts` is backed up; if corruption is detected, it's automatically restored
+5. **Backup & Recovery**: Successful replacements refresh a valid backup transactionally. Corrupt markers are restored only from a backup with one valid ordered marker pair; a missing or invalid backup fails closed without replacing the target. `sdhm regenerate` remains available for an explicit fresh baseline.
 
 ## Development
 
@@ -185,11 +196,14 @@ make build
 ### Testing
 
 ```bash
-# Run all tests
-make test
+# Run the complete local gate used by CI
+make check
 
 # Run tests with coverage
 make test-coverage
+
+# Run tests without the race detector
+make test
 
 # Run quick tests only
 make test-short
@@ -201,14 +215,27 @@ make test-short
 # Format code
 make fmt
 
-# Run go vet
-make vet
+# Check formatting without modifying files
+make fmt-check
 
-# Update dependencies
+# Check module files without modifying them
+make tidy-check
+
+# Run race-enabled tests
+make test-race
+
+# Run formatting, module, race, vet, and build gates
+make check
+```
+
+Dependency maintenance is explicit and mutating:
+
+```bash
+# Update dependencies, then tidy the module
 make update
 
-# Modernize code (format, vet, update, apply latest Go patterns)
-make modernize
+# Tidy without updating dependency versions
+make tidy
 ```
 
 ### Available Make Targets
@@ -216,7 +243,7 @@ make modernize
 Run `make help` to see all available targets:
 
 ```
- all              All targets (test + build)
+ all              Run tests and build the binary
  build            Build the sdhm binary
  clean            Clean build artifacts and test files
  test             Run all tests (doesn't touch production /etc/hosts)
@@ -225,10 +252,12 @@ Run `make help` to see all available targets:
  deps             Download dependencies
  update           Update dependencies to latest versions
  tidy             Tidy go.mod
- modernize        Modernize the project (format, vet, update, tidy)
  fmt              Format code
+ fmt-check        Check that tracked Go files are formatted
  vet              Run go vet
- lint             Run golangci-lint
+ tidy-check       Check module files without modifying them
+ test-race        Run all tests with the race detector
+ check            Run formatting, module, race, vet, and build gates
  run              Run the application with example interval
  install          Install the binary to /usr/local/bin
  uninstall        Remove the binary from /usr/local/bin
@@ -280,7 +309,7 @@ Contributions are welcome! Please:
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Run tests: `make test`
+4. Run the complete gate: `make check`
 5. Submit a pull request
 
 ## License
