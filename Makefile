@@ -17,11 +17,13 @@ BINARY_NAME=sdhm
 BINARY_PATH=./cmd/sdhm
 BUILD_DIR=build
 VERSION?=0.0.0.0-dev
+TEST_PACKAGES ?= ./...
+TEST_FLAGS ?=
 
 # Build flags
 LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
 
-.PHONY: all build clean test coverage deps update tidy modernize fmt vet lint help run install
+.PHONY: all build clean test test-short test-coverage deps update tidy modernize fmt vet lint help run install uninstall fmt-check tidy-check test-race check
 
 # Default target
 all: test build
@@ -41,9 +43,19 @@ clean:
 
 ## test: Run all tests (doesn't touch production /etc/hosts)
 test:
-	@echo "Running tests..."
-	@echo "Note: Tests use temporary files and do not modify production /etc/hosts"
-	$(GOTEST) -v ./...
+	$(GOTEST) $(TEST_FLAGS) $(TEST_PACKAGES)
+
+fmt-check:
+	@diff="$$(git ls-files -z '*.go' | xargs -0 gofmt -d)"; \
+	if [ -n "$$diff" ]; then echo "$$diff"; exit 1; fi
+
+tidy-check:
+	$(GOMOD) tidy -diff
+
+test-race:
+	$(GOTEST) -race $(TEST_FLAGS) $(TEST_PACKAGES)
+
+check: fmt-check tidy-check test-race vet build
 
 ## test-short: Run short tests
 test-short:

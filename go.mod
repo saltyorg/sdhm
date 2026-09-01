@@ -1,6 +1,6 @@
 module github.com/saltyorg/sdhm
 
-go 1.25.5
+go 1.27.0
 
 require (
 	github.com/moby/moby/api v1.52.0
