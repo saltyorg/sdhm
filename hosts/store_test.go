@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"net/netip"
 	"os"
@@ -27,6 +28,9 @@ type faultOps struct {
 	openDirs        []string
 	readbackPending bool
 	readbackBytes   []byte
+	afterOpenRead   func(string)
+	afterChown      func(string)
+	chmodModes      []fs.FileMode
 	afterRename     func(string, string)
 }
 
@@ -36,20 +40,25 @@ func newFaultOps() *faultOps {
 		failAt: make(map[string]int),
 		calls:  make(map[string]int),
 		failErr: map[string]error{
-			"lstat":       errors.New("injected lstat failure"),
-			"read":        errors.New("injected read failure"),
-			"create_temp": errors.New("injected create-temp failure"),
-			"write":       errors.New("injected write failure"),
-			"chmod":       errors.New("injected chmod failure"),
-			"chown":       errors.New("injected chown failure"),
-			"file_sync":   errors.New("injected file-sync failure"),
-			"file_close":  errors.New("injected file-close failure"),
-			"rename":      errors.New("injected rename failure"),
-			"open_dir":    errors.New("injected open-dir failure"),
-			"dir_sync":    errors.New("injected dir-sync failure"),
-			"dir_close":   errors.New("injected dir-close failure"),
-			"readback":    errors.New("injected readback failure"),
-			"remove":      errors.New("injected remove failure"),
+			"open_read":      errors.New("injected open-read failure"),
+			"read_stat":      errors.New("injected read-stat failure"),
+			"read":           errors.New("injected read failure"),
+			"read_close":     errors.New("injected read-close failure"),
+			"create_temp":    errors.New("injected create-temp failure"),
+			"write":          errors.New("injected write failure"),
+			"chmod":          errors.New("injected chmod failure"),
+			"chown":          errors.New("injected chown failure"),
+			"file_sync":      errors.New("injected file-sync failure"),
+			"file_close":     errors.New("injected file-close failure"),
+			"rename":         errors.New("injected rename failure"),
+			"open_dir":       errors.New("injected open-dir failure"),
+			"dir_sync":       errors.New("injected dir-sync failure"),
+			"dir_close":      errors.New("injected dir-close failure"),
+			"readback_open":  errors.New("injected readback-open failure"),
+			"readback_stat":  errors.New("injected readback-stat failure"),
+			"readback":       errors.New("injected readback failure"),
+			"readback_close": errors.New("injected readback-close failure"),
+			"remove":         errors.New("injected remove failure"),
 		},
 	}
 }
@@ -63,30 +72,43 @@ func (o *faultOps) fault(operation string) error {
 	return nil
 }
 
-func (o *faultOps) Lstat(path string) (fs.FileInfo, error) {
-	if err := o.fault("lstat"); err != nil {
-		return nil, err
-	}
-	return o.base.Lstat(path)
-}
-
-func (o *faultOps) ReadFile(path string) ([]byte, error) {
-	operation := "read"
-	if o.readbackPending {
-		operation = "readback"
+func (o *faultOps) OpenReadNoFollow(path string) (readHandle, error) {
+	readback := o.readbackPending
+	if readback {
 		o.readbackPending = false
 	}
-	if err := o.fault(operation); err != nil {
+	openOperation := "open_read"
+	statOperation := "read_stat"
+	readOperation := "read"
+	closeOperation := "read_close"
+	if readback {
+		openOperation = "readback_open"
+		statOperation = "readback_stat"
+		readOperation = "readback"
+		closeOperation = "readback_close"
+	}
+	if err := o.fault(openOperation); err != nil {
 		return nil, err
 	}
-	data, err := o.base.ReadFile(path)
+	file, err := o.base.OpenReadNoFollow(path)
 	if err != nil {
 		return nil, err
 	}
-	if operation == "readback" && o.readbackBytes != nil {
-		return bytes.Clone(o.readbackBytes), nil
+	if !readback && o.afterOpenRead != nil {
+		o.afterOpenRead(path)
 	}
-	return data, nil
+	reader := io.Reader(file)
+	if readback && o.readbackBytes != nil {
+		reader = bytes.NewReader(bytes.Clone(o.readbackBytes))
+	}
+	return &faultReadHandle{
+		readHandle:     file,
+		reader:         reader,
+		ops:            o,
+		statOperation:  statOperation,
+		readOperation:  readOperation,
+		closeOperation: closeOperation,
+	}, nil
 }
 
 func (o *faultOps) CreateTemp(dir, pattern string) (syncFile, error) {
@@ -140,6 +162,38 @@ type faultFile struct {
 	ops *faultOps
 }
 
+type faultReadHandle struct {
+	readHandle
+	reader         io.Reader
+	ops            *faultOps
+	statOperation  string
+	readOperation  string
+	closeOperation string
+	readStarted    bool
+}
+
+func (f *faultReadHandle) Stat() (fs.FileInfo, error) {
+	if err := f.ops.fault(f.statOperation); err != nil {
+		return nil, err
+	}
+	return f.readHandle.Stat()
+}
+
+func (f *faultReadHandle) Read(data []byte) (int, error) {
+	if !f.readStarted {
+		f.readStarted = true
+		if err := f.ops.fault(f.readOperation); err != nil {
+			return 0, err
+		}
+	}
+	return f.reader.Read(data)
+}
+
+func (f *faultReadHandle) Close() error {
+	faultErr := f.ops.fault(f.closeOperation)
+	return errors.Join(faultErr, f.readHandle.Close())
+}
+
 func (f *faultFile) Write(data []byte) (int, error) {
 	if err := f.ops.fault("write"); err != nil {
 		return 0, err
@@ -148,6 +202,7 @@ func (f *faultFile) Write(data []byte) (int, error) {
 }
 
 func (f *faultFile) Chmod(mode fs.FileMode) error {
+	f.ops.chmodModes = append(f.ops.chmodModes, mode)
 	if err := f.ops.fault("chmod"); err != nil {
 		return err
 	}
@@ -158,7 +213,13 @@ func (f *faultFile) Chown(uid, gid int) error {
 	if err := f.ops.fault("chown"); err != nil {
 		return err
 	}
-	return f.syncFile.Chown(uid, gid)
+	if err := f.syncFile.Chown(uid, gid); err != nil {
+		return err
+	}
+	if f.ops.afterChown != nil {
+		f.ops.afterChown(f.Name())
+	}
+	return nil
 }
 
 func (f *faultFile) Sync() error {
@@ -190,27 +251,27 @@ func (d *faultDir) Close() error {
 	return errors.Join(faultErr, d.syncDir.Close())
 }
 
-func TestFileOpsFaultsLstatOnConfiguredCall(t *testing.T) {
+func TestFileOpsFaultsOpenReadOnConfiguredCall(t *testing.T) {
 	target, _ := createTarget(t, "old\n", 0o640)
 	ops := newFaultOps()
-	ops.failAt["lstat"] = 2
+	ops.failAt["open_read"] = 2
 
-	info, err := ops.Lstat(target)
+	file, err := ops.OpenReadNoFollow(target)
 	if err != nil {
-		t.Fatalf("first Lstat() error = %v", err)
+		t.Fatalf("first OpenReadNoFollow() error = %v", err)
 	}
-	if !info.Mode().IsRegular() {
-		t.Fatalf("first Lstat() mode = %v, want regular file", info.Mode())
+	if err := file.Close(); err != nil {
+		t.Fatalf("close first handle: %v", err)
 	}
-	if _, err := ops.Lstat(target); !errors.Is(err, ops.failErr["lstat"]) {
-		t.Fatalf("second Lstat() error = %v, want %v", err, ops.failErr["lstat"])
+	if _, err := ops.OpenReadNoFollow(target); !errors.Is(err, ops.failErr["open_read"]) {
+		t.Fatalf("second OpenReadNoFollow() error = %v, want %v", err, ops.failErr["open_read"])
 	}
-	info, err = ops.Lstat(target)
+	file, err = ops.OpenReadNoFollow(target)
 	if err != nil {
-		t.Fatalf("third Lstat() error = %v", err)
+		t.Fatalf("third OpenReadNoFollow() error = %v", err)
 	}
-	if !info.Mode().IsRegular() {
-		t.Fatalf("third Lstat() mode = %v, want regular file", info.Mode())
+	if err := file.Close(); err != nil {
+		t.Fatalf("close third handle: %v", err)
 	}
 }
 
@@ -219,22 +280,136 @@ func TestFileOpsFaultsReadOnConfiguredCall(t *testing.T) {
 	ops := newFaultOps()
 	ops.failAt["read"] = 2
 
-	data, err := ops.ReadFile(target)
+	file, err := ops.OpenReadNoFollow(target)
 	if err != nil {
-		t.Fatalf("first ReadFile() error = %v", err)
+		t.Fatalf("open first handle: %v", err)
+	}
+	data, err := io.ReadAll(file)
+	closeErr := file.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("first read/close errors = (%v, %v)", err, closeErr)
 	}
 	if !bytes.Equal(data, []byte("old\n")) {
-		t.Fatalf("first ReadFile() = %q, want %q", data, "old\n")
+		t.Fatalf("first read = %q, want %q", data, "old\n")
 	}
-	if _, err := ops.ReadFile(target); !errors.Is(err, ops.failErr["read"]) {
-		t.Fatalf("second ReadFile() error = %v, want %v", err, ops.failErr["read"])
-	}
-	data, err = ops.ReadFile(target)
+	file, err = ops.OpenReadNoFollow(target)
 	if err != nil {
-		t.Fatalf("third ReadFile() error = %v", err)
+		t.Fatalf("open second handle: %v", err)
+	}
+	if _, err := io.ReadAll(file); !errors.Is(err, ops.failErr["read"]) {
+		t.Fatalf("second read error = %v, want %v", err, ops.failErr["read"])
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close second handle: %v", err)
+	}
+	file, err = ops.OpenReadNoFollow(target)
+	if err != nil {
+		t.Fatalf("open third handle: %v", err)
+	}
+	data, err = io.ReadAll(file)
+	closeErr = file.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("third read/close errors = (%v, %v)", err, closeErr)
 	}
 	if !bytes.Equal(data, []byte("old\n")) {
-		t.Fatalf("third ReadFile() = %q, want %q", data, "old\n")
+		t.Fatalf("third read = %q, want %q", data, "old\n")
+	}
+}
+
+func TestReadOptionalRegularFileSurfacesDescriptorPhaseFailures(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation string
+	}{
+		{name: "open", operation: "open_read"},
+		{name: "stat", operation: "read_stat"},
+		{name: "read", operation: "read"},
+		{name: "close", operation: "read_close"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target, _ := createTarget(t, "old\n", 0o640)
+			ops := newFaultOps()
+			ops.failAt[tt.operation] = 1
+			store := newStore(ops)
+
+			_, _, _, err := store.readOptionalRegularFile(target)
+			if !errors.Is(err, ops.failErr[tt.operation]) {
+				t.Fatalf("readOptionalRegularFile() error = %v, want %v", err, ops.failErr[tt.operation])
+			}
+		})
+	}
+}
+
+func TestReadOptionalRegularFileJoinsReadAndCloseFailures(t *testing.T) {
+	target, _ := createTarget(t, "old\n", 0o640)
+	ops := newFaultOps()
+	ops.failAt["read"] = 1
+	ops.failAt["read_close"] = 1
+	store := newStore(ops)
+
+	_, _, _, err := store.readOptionalRegularFile(target)
+	for _, operation := range []string{"read", "read_close"} {
+		if !errors.Is(err, ops.failErr[operation]) {
+			t.Errorf("readOptionalRegularFile() error = %v, want joined %s error", err, operation)
+		}
+	}
+}
+
+func TestStorePrepareUsesOpenedFileAcrossSymlinkPathSwap(t *testing.T) {
+	const (
+		section = "DOCKER CONTAINERS"
+		decoy   = "127.0.0.1 decoy\n# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n"
+		target  = "127.0.0.1 symlink-target\n# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n"
+	)
+
+	dir := t.TempDir()
+	hostsPath := filepath.Join(dir, "hosts")
+	openedPath := filepath.Join(dir, "opened-decoy")
+	referencedPath := filepath.Join(dir, "referenced")
+	backupPath := filepath.Join(dir, "hosts.backup")
+	if err := os.WriteFile(hostsPath, []byte(decoy), 0o600); err != nil {
+		t.Fatalf("write decoy: %v", err)
+	}
+	if err := os.WriteFile(referencedPath, []byte(target), 0o644); err != nil {
+		t.Fatalf("write symlink target: %v", err)
+	}
+
+	ops := newFaultOps()
+	swapped := false
+	ops.afterOpenRead = func(path string) {
+		if path != hostsPath || swapped {
+			return
+		}
+		swapped = true
+		if err := os.Rename(hostsPath, openedPath); err != nil {
+			t.Errorf("move opened decoy: %v", err)
+			return
+		}
+		if err := os.Symlink(referencedPath, hostsPath); err != nil {
+			t.Errorf("replace path with symlink: %v", err)
+		}
+	}
+	store := NewStore(hostsPath, backupPath, section, "saltbox")
+	store.ops = ops
+
+	if err := store.Prepare(t.Context()); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if !swapped {
+		t.Fatal("path swap did not run")
+	}
+	assertFileContent(t, openedPath, []byte(decoy))
+	assertFileContent(t, referencedPath, []byte(target))
+	assertFileContent(t, backupPath, []byte(decoy))
+	assertFileMode(t, backupPath, 0o600)
+	info, err := os.Lstat(hostsPath)
+	if err != nil {
+		t.Fatalf("lstat swapped path: %v", err)
+	}
+	if info.Mode()&fs.ModeSymlink == 0 {
+		t.Fatalf("swapped path mode = %v, want symlink", info.Mode())
 	}
 }
 
@@ -284,17 +459,20 @@ func TestReplaceFileSuccess(t *testing.T) {
 	assertNoTempFiles(t, target, ops.tempPaths)
 
 	wantCalls := map[string]int{
-		"create_temp": 1,
-		"chmod":       1,
-		"chown":       1,
-		"write":       1,
-		"file_sync":   1,
-		"file_close":  1,
-		"rename":      1,
-		"open_dir":    1,
-		"dir_sync":    1,
-		"dir_close":   1,
-		"readback":    1,
+		"create_temp":    1,
+		"chmod":          2,
+		"chown":          1,
+		"write":          1,
+		"file_sync":      1,
+		"file_close":     1,
+		"rename":         1,
+		"open_dir":       1,
+		"dir_sync":       1,
+		"dir_close":      1,
+		"readback_open":  1,
+		"readback_stat":  1,
+		"readback":       1,
+		"readback_close": 1,
 	}
 	for operation, want := range wantCalls {
 		if got := ops.calls[operation]; got != want {
@@ -306,6 +484,7 @@ func TestReplaceFileSuccess(t *testing.T) {
 	}
 	wantOrder := []string{
 		"create_temp",
+		"chmod",
 		"chown",
 		"write",
 		"chmod",
@@ -315,11 +494,48 @@ func TestReplaceFileSuccess(t *testing.T) {
 		"open_dir",
 		"dir_sync",
 		"dir_close",
+		"readback_open",
+		"readback_stat",
 		"readback",
+		"readback_close",
 	}
 	if !slices.Equal(ops.callOrder, wantOrder) {
 		t.Errorf("file operation order = %q, want %q", ops.callOrder, wantOrder)
 	}
+}
+
+func TestReplaceFileRestrictsOwnedTempBeforeChownAndWrite(t *testing.T) {
+	target, metadata := createTarget(t, "old\n", 0o750)
+	metadata.mode |= fs.ModeSetuid | fs.ModeSetgid
+	ops := newFaultOps()
+	var (
+		modeAfterChown fs.FileMode
+		statErr        error
+	)
+	ops.afterChown = func(path string) {
+		var info fs.FileInfo
+		info, statErr = os.Lstat(path)
+		if statErr == nil {
+			modeAfterChown = info.Mode().Perm()
+		}
+	}
+	store := newStore(ops)
+
+	if _, err := store.replaceFile(t.Context(), target, []byte("new\n"), metadata); err != nil {
+		t.Fatalf("replaceFile() error = %v", err)
+	}
+	if statErr != nil {
+		t.Fatalf("lstat temporary file after chown: %v", statErr)
+	}
+	if modeAfterChown != 0 {
+		t.Fatalf("temporary mode after chown = %04o, want 0000", modeAfterChown)
+	}
+	wantChmodModes := []fs.FileMode{0, metadata.mode}
+	if !slices.Equal(ops.chmodModes, wantChmodModes) {
+		t.Fatalf("temporary chmod modes = %v, want %v", ops.chmodModes, wantChmodModes)
+	}
+	assertFileContent(t, target, []byte("new\n"))
+	assertFileModeBits(t, target, metadata.mode)
 }
 
 func TestReplaceFilePreservesSpecialModeBitsOnOwnedFile(t *testing.T) {
@@ -346,21 +562,23 @@ func TestReplaceFilePreRenameFailuresLeaveTargetUnchanged(t *testing.T) {
 	tests := []struct {
 		name      string
 		operation string
+		failAt    int
 	}{
-		{name: "create temp", operation: "create_temp"},
-		{name: "chmod", operation: "chmod"},
-		{name: "chown", operation: "chown"},
-		{name: "write", operation: "write"},
-		{name: "file sync", operation: "file_sync"},
-		{name: "file close", operation: "file_close"},
-		{name: "rename", operation: "rename"},
+		{name: "create temp", operation: "create_temp", failAt: 1},
+		{name: "restrictive chmod", operation: "chmod", failAt: 1},
+		{name: "chown", operation: "chown", failAt: 1},
+		{name: "write", operation: "write", failAt: 1},
+		{name: "final chmod", operation: "chmod", failAt: 2},
+		{name: "file sync", operation: "file_sync", failAt: 1},
+		{name: "file close", operation: "file_close", failAt: 1},
+		{name: "rename", operation: "rename", failAt: 1},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			target, metadata := createTarget(t, "old\n", 0o640)
 			ops := newFaultOps()
-			ops.failAt[tt.operation] = 1
+			ops.failAt[tt.operation] = tt.failAt
 			store := newStore(ops)
 
 			renamed, err := store.replaceFile(t.Context(), target, []byte("new\n"), metadata)
@@ -464,7 +682,10 @@ func TestReplaceFilePostRenameFailuresReportRenamed(t *testing.T) {
 		{name: "open parent directory", operation: "open_dir"},
 		{name: "sync parent directory", operation: "dir_sync"},
 		{name: "close parent directory", operation: "dir_close"},
+		{name: "open destination for readback", operation: "readback_open"},
+		{name: "stat destination for readback", operation: "readback_stat"},
 		{name: "read destination back", operation: "readback"},
+		{name: "close destination after readback", operation: "readback_close"},
 	}
 
 	for _, tt := range tests {

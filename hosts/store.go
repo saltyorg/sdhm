@@ -265,22 +265,40 @@ func (s *Store) readRegularFile(path string) ([]byte, fileMetadata, error) {
 }
 
 func (s *Store) readOptionalRegularFile(path string) ([]byte, fileMetadata, bool, error) {
-	info, err := s.ops.Lstat(path)
+	file, err := s.ops.OpenReadNoFollow(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, fileMetadata{}, false, nil
 	}
 	if err != nil {
-		return nil, fileMetadata{}, false, fmt.Errorf("lstat %q: %w", path, err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fileMetadata{}, false, fmt.Errorf("%q is not a regular file", path)
+		return nil, fileMetadata{}, false, fmt.Errorf("open %q without following symlinks: %w", path, err)
 	}
 
-	data, err := s.ops.ReadFile(path)
+	info, err := file.Stat()
 	if err != nil {
-		return nil, fileMetadata{}, false, fmt.Errorf("read %q: %w", path, err)
+		primary := fmt.Errorf("stat opened file %q: %w", path, err)
+		return nil, fileMetadata{}, false, joinReadClose(primary, file, path)
+	}
+	if !info.Mode().IsRegular() {
+		primary := fmt.Errorf("%q is not a regular file", path)
+		return nil, fileMetadata{}, false, joinReadClose(primary, file, path)
+	}
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		primary := fmt.Errorf("read opened file %q: %w", path, err)
+		return nil, fileMetadata{}, false, joinReadClose(primary, file, path)
+	}
+	if err := joinReadClose(nil, file, path); err != nil {
+		return nil, fileMetadata{}, false, err
 	}
 	return data, metadataFromInfo(info), true, nil
+}
+
+func joinReadClose(primary error, file readHandle, path string) error {
+	if err := file.Close(); err != nil {
+		return errors.Join(primary, fmt.Errorf("close opened file %q: %w", path, err))
+	}
+	return primary
 }
 
 func metadataFromInfo(info fs.FileInfo) fileMetadata {
@@ -369,6 +387,13 @@ func (s *Store) replaceFile(ctx context.Context, target string, data []byte, met
 	}
 
 	if metadata.setOwnership {
+		if err := checkContext(ctx, "restrict temporary file mode"); err != nil {
+			return false, cleanup(err)
+		}
+		if err := temp.Chmod(0); err != nil {
+			return false, cleanup(fmt.Errorf("restrict temporary file mode: %w", err))
+		}
+
 		if err := checkContext(ctx, "set temporary file ownership"); err != nil {
 			return false, cleanup(err)
 		}
@@ -435,7 +460,7 @@ func (s *Store) replaceFile(ctx context.Context, target string, data []byte, met
 	if err := checkContext(ctx, "read destination back"); err != nil {
 		return true, err
 	}
-	readback, err := s.ops.ReadFile(target)
+	readback, _, err := s.readRegularFile(target)
 	if err != nil {
 		return true, fmt.Errorf("read destination %q back: %w", target, err)
 	}

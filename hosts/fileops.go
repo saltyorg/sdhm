@@ -4,7 +4,14 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"syscall"
 )
+
+type readHandle interface {
+	io.Reader
+	Stat() (fs.FileInfo, error)
+	Close() error
+}
 
 type syncFile interface {
 	io.Writer
@@ -21,8 +28,7 @@ type syncDir interface {
 }
 
 type fileOps interface {
-	Lstat(string) (fs.FileInfo, error)
-	ReadFile(string) ([]byte, error)
+	OpenReadNoFollow(string) (readHandle, error)
 	CreateTemp(string, string) (syncFile, error)
 	Rename(string, string) error
 	Remove(string) error
@@ -31,12 +37,8 @@ type fileOps interface {
 
 type osFileOps struct{}
 
-func (osFileOps) Lstat(path string) (fs.FileInfo, error) {
-	return os.Lstat(path)
-}
-
-func (osFileOps) ReadFile(path string) ([]byte, error) {
-	return os.ReadFile(path)
+func (osFileOps) OpenReadNoFollow(path string) (readHandle, error) {
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 }
 
 func (osFileOps) CreateTemp(dir, pattern string) (syncFile, error) {
