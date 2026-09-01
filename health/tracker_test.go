@@ -70,6 +70,34 @@ func TestTrackerInitializationIsTransientState(t *testing.T) {
 	}
 }
 
+func TestTrackerZeroValueIsUsable(t *testing.T) {
+	var tracker Tracker
+	for i := range maxHistoryRecords + 1 {
+		tracker.Fail(ConcernDockerSnapshot, fmt.Sprintf("failure %d", i))
+	}
+
+	snapshot := tracker.Snapshot()
+	if snapshot.Ready {
+		t.Fatal("zero-value tracker is ready before initialization completes")
+	}
+	if got, want := len(snapshot.History), maxHistoryRecords; got != want {
+		t.Fatalf("zero-value history length = %d, want %d", got, want)
+	}
+	if got, want := snapshot.Active[ConcernDockerSnapshot], snapshot.History[len(snapshot.History)-1].id; got != want {
+		t.Fatalf("zero-value active ID = %d, want newest ID %d", got, want)
+	}
+	if snapshot.History[0].Timestamp.IsZero() {
+		t.Fatal("zero-value tracker recorded a zero timestamp")
+	}
+
+	tracker.Recover(ConcernDockerSnapshot)
+	tracker.CompleteInitialization()
+	snapshot = tracker.Snapshot()
+	if !snapshot.Ready || len(snapshot.Active) != 0 {
+		t.Fatalf("zero-value tracker after recovery = %+v, want ready with no active concerns", snapshot)
+	}
+}
+
 func TestTrackerConcernMappings(t *testing.T) {
 	tests := []struct {
 		concern   Concern

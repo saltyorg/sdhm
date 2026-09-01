@@ -58,7 +58,8 @@ type Snapshot struct {
 	History []Record
 }
 
-// Tracker stores current concerns and a bounded diagnostic history.
+// Tracker stores current concerns and a bounded diagnostic history. Its zero
+// value is usable and starts unready.
 type Tracker struct {
 	mu      sync.RWMutex
 	ready   bool
@@ -104,6 +105,7 @@ func (t *Tracker) Fail(concern Concern, message string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	t.ensureDefaults()
 	details := concernDetailsByConcern[concern]
 	t.nextID++
 	record := Record{
@@ -117,6 +119,18 @@ func (t *Tracker) Fail(concern Concern, message string) {
 	t.history = append(t.history, record)
 	t.active[concern] = record.id
 	t.evictHistory()
+}
+
+func (t *Tracker) ensureDefaults() {
+	if t.active == nil {
+		t.active = make(map[Concern]uint64)
+	}
+	if t.max <= 0 {
+		t.max = maxHistoryRecords
+	}
+	if t.now == nil {
+		t.now = time.Now
+	}
 }
 
 // Recover removes concern from the current active conditions while keeping history.

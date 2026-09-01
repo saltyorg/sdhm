@@ -38,7 +38,10 @@ func NewHandler(tracker *Tracker) http.Handler {
 		if !response.Healthy {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
-		_ = json.NewEncoder(w).Encode(response)
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			// Headers may already be committed, so no fallback response is safe.
+			return
+		}
 	})
 }
 

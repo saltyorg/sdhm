@@ -467,45 +467,70 @@ func TestRunRealHealthListenerWaitsForInitialReconciliation(t *testing.T) {
 }
 
 func TestRunInitialReconciliationFailureCompletesInitializationWithActiveConcern(t *testing.T) {
-	log := &operationLog{}
-	events := make(chan Event)
-	eventErrors := make(chan error)
-	loopStarted := make(chan struct{})
-	snapshotErr := errors.New("snapshot sentinel")
-	source := &orderedSource{
-		log:         log,
-		snapshotErr: snapshotErr,
-		events:      events,
-		eventErrors: eventErrors,
-		onEvents: func(context.Context, []string) {
-			close(loopStarted)
+	tests := []struct {
+		name      string
+		concern   health.Concern
+		configure func(*orderedSource, *orderedStore)
+	}{
+		{
+			name:    "snapshot failure",
+			concern: health.ConcernDockerSnapshot,
+			configure: func(source *orderedSource, _ *orderedStore) {
+				source.snapshotErr = errors.New("snapshot sentinel")
+			},
+		},
+		{
+			name:    "apply failure",
+			concern: health.ConcernHostsApply,
+			configure: func(_ *orderedSource, store *orderedStore) {
+				store.applyErr = errors.New("apply sentinel")
+			},
 		},
 	}
-	tracker := health.NewTracker()
-	ctx, cancel := context.WithCancel(t.Context())
-	daemon := mustNewDaemon(
-		t,
-		validConfig(),
-		source,
-		&orderedStore{log: log},
-		tracker,
-		newOrderedHealthServer(log),
-	)
-	result := make(chan error, 1)
-	go func() { result <- daemon.Run(ctx) }()
 
-	<-loopStarted
-	assertReadiness(t, tracker, true)
-	assertActiveConcerns(t, tracker, health.ConcernDockerSnapshot)
-	recorder := httptest.NewRecorder()
-	health.NewHandler(tracker).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/health", nil))
-	if recorder.Code != http.StatusServiceUnavailable {
-		t.Fatalf("health status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			log := &operationLog{}
+			events := make(chan Event)
+			eventErrors := make(chan error)
+			loopStarted := make(chan struct{})
+			source := &orderedSource{
+				log:         log,
+				events:      events,
+				eventErrors: eventErrors,
+				onEvents: func(context.Context, []string) {
+					close(loopStarted)
+				},
+			}
+			store := &orderedStore{log: log}
+			tt.configure(source, store)
+			tracker := health.NewTracker()
+			ctx, cancel := context.WithCancel(t.Context())
+			daemon := mustNewDaemon(
+				t,
+				validConfig(),
+				source,
+				store,
+				tracker,
+				newOrderedHealthServer(log),
+			)
+			result := make(chan error, 1)
+			go func() { result <- daemon.Run(ctx) }()
 
-	cancel()
-	if err := <-result; err != nil {
-		t.Fatalf("Run() error = %v, want nil", err)
+			<-loopStarted
+			assertReadiness(t, tracker, true)
+			assertActiveConcerns(t, tracker, tt.concern)
+			recorder := httptest.NewRecorder()
+			health.NewHandler(tracker).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/health", nil))
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Fatalf("health status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+			}
+
+			cancel()
+			if err := <-result; err != nil {
+				t.Fatalf("Run() error = %v, want nil", err)
+			}
+		})
 	}
 }
 

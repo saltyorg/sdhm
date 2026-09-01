@@ -101,6 +101,8 @@ sdhm --hosts-file /tmp/test-hosts --networks bridge
 | `--debounce-delay` | | `1s` | Debounce delay for event handling |
 | `--debounce-max-delay` | | `5s` | Maximum debounce delay |
 
+`--health-addr` must be a literal IPv4 or IPv6 address, and `--health-port` must be in `1..65535`. The health endpoint is registered as `GET /health`; unsupported methods receive HTTP 405.
+
 ### Network and Alias Rules
 
 `--networks/-n` keeps its historical comma-separated syntax. SDHM trims surrounding spaces, ignores empty items, removes duplicates while preserving first occurrence order, and requires at least one network.
@@ -109,7 +111,7 @@ The resolved default network receives both `alias` and `alias.<network>` names. 
 
 ### Time Duration Formats
 
-Interval and debounce values accept positive Go durations, including milliseconds and compound values such as `500ms`, `1m30s`, and `2h15m`. Exact positive integer days such as `1d` or `7d` are also accepted. Zero and negative durations are rejected.
+Interval and debounce values accept positive, case-sensitive Go durations, including milliseconds and compound values such as `500ms`, `1m30s`, and `2h15m`. Exact positive integer days such as `1d` or `7d` are also accepted. Zero and negative durations are rejected.
 
 ### Health Check Endpoint
 
@@ -185,7 +187,7 @@ sudo journalctl -u sdhm -f
    172.18.0.3  webserver
    # END DOCKER CONTAINERS
    ```
-5. **Backup & Recovery**: Successful replacements refresh a valid backup transactionally. Corrupt markers are restored only from a backup with one valid ordered marker pair; a missing or invalid backup fails closed without replacing the target. `sdhm regenerate` remains available for an explicit fresh baseline.
+5. **Backup & Recovery**: Successful replacements refresh a valid backup transactionally. Corrupt markers are restored only from a backup with one valid ordered marker pair; a missing or invalid backup fails closed without replacing the target. Symlink, FIFO, directory, and other non-regular target or backup paths are rejected rather than replaced. `sdhm regenerate` remains available for an explicit fresh baseline.
 
 ## Development
 

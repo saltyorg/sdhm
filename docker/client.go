@@ -150,12 +150,46 @@ func (c *Client) Events(ctx context.Context, networks []string) (<-chan daemon.E
 		defer close(mappedEvents)
 		defer close(mappedErrors)
 
+		forwardError := func(err error) {
+			if err == nil {
+				return
+			}
+			select {
+			case mappedErrors <- err:
+			case <-ctx.Done():
+			}
+		}
+		sourceErrorReady := func() (error, bool) {
+			select {
+			case err, ok := <-source.Err:
+				if !ok {
+					return nil, true
+				}
+				return err, true
+			default:
+				return nil, false
+			}
+		}
+
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			if err, ready := sourceErrorReady(); ready {
+				forwardError(err)
+				return
+			}
+
 			select {
 			case <-ctx.Done():
 				return
 			case event, ok := <-source.Messages:
 				if !ok {
+					if err, ready := sourceErrorReady(); ready {
+						forwardError(err)
+					}
 					return
 				}
 				select {
@@ -164,13 +198,10 @@ func (c *Client) Events(ctx context.Context, networks []string) (<-chan daemon.E
 					return
 				}
 			case err, ok := <-source.Err:
-				if !ok || err == nil {
+				if !ok {
 					return
 				}
-				select {
-				case mappedErrors <- err:
-				case <-ctx.Done():
-				}
+				forwardError(err)
 				return
 			}
 		}

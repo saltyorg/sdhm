@@ -548,6 +548,33 @@ func TestEventsForwardsSourceErrorAndClosesMappedChannels(t *testing.T) {
 	}
 }
 
+func TestEventsPrioritizesBufferedSourceErrorOverMessageClosure(t *testing.T) {
+	for iteration := range 100 {
+		api := newFakeAPI()
+		sourceEvents := make(chan events.Message)
+		sourceErrors := make(chan error, 1)
+		wantErr := errors.New("buffered event stream failure")
+		sourceErrors <- wantErr
+		close(sourceEvents)
+		close(sourceErrors)
+		api.eventsFn = func(context.Context, mobyclient.EventsListOptions) mobyclient.EventsResult {
+			return mobyclient.EventsResult{Messages: sourceEvents, Err: sourceErrors}
+		}
+
+		mappedEvents, mappedErrors := newClient(api).Events(t.Context(), []string{"saltbox"})
+		err, ok := receiveOK(t, mappedErrors)
+		if !ok || !errors.Is(err, wantErr) {
+			t.Fatalf("iteration %d mapped error = (%v, %t), want buffered %v", iteration, err, ok, wantErr)
+		}
+		if _, ok := receiveOK(t, mappedEvents); ok {
+			t.Fatalf("iteration %d mapped event channel remained open", iteration)
+		}
+		if _, ok := receiveOK(t, mappedErrors); ok {
+			t.Fatalf("iteration %d mapped error channel remained open", iteration)
+		}
+	}
+}
+
 func TestEventsClosesMappedChannelsWhenSourceCloses(t *testing.T) {
 	api := newFakeAPI()
 	sourceEvents := make(chan events.Message)

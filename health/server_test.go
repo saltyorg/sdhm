@@ -91,7 +91,7 @@ func TestServerCompletedShutdownPrecedesCanceledContext(t *testing.T) {
 		t.Fatalf("initial Shutdown() error = %v", err)
 	}
 
-	canceledCtx, cancel := context.WithCancel(context.Background())
+	canceledCtx, cancel := context.WithCancel(t.Context())
 	cancel()
 	for range 100 {
 		if err := server.Shutdown(canceledCtx); err != nil {
