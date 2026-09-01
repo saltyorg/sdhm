@@ -43,6 +43,37 @@ func TestHandlerEmptyTracker(t *testing.T) {
 	}
 }
 
+func TestHandlerInitializing(t *testing.T) {
+	tracker := NewTracker()
+	tracker.BeginInitialization()
+
+	result, recorder := serve(t, tracker)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if result.Healthy || result.Status != "degraded" {
+		t.Fatalf("response health = %#v, want degraded", result)
+	}
+	if got, want := result.Message, "System initializing"; got != want {
+		t.Fatalf("message = %q, want %q", got, want)
+	}
+	if got, want := result.Reason, "initialization has not completed"; got != want {
+		t.Fatalf("reason = %q, want %q", got, want)
+	}
+	if got, want := result.TimeUntilHealthy, "unknown"; got != want {
+		t.Fatalf("time until healthy = %q, want %q", got, want)
+	}
+	if result.ErrorCount != 0 || len(result.Errors) != 0 {
+		t.Fatalf("initialization history = %d records, want 0", result.ErrorCount)
+	}
+
+	tracker.CompleteInitialization()
+	result, recorder = serve(t, tracker)
+	if recorder.Code != http.StatusOK || !result.Healthy {
+		t.Fatalf("response after initialization = (%d, %#v), want healthy", recorder.Code, result)
+	}
+}
+
 func TestHandlerActiveFailure(t *testing.T) {
 	tracker := newTracker(10, func() time.Time { return time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC) })
 	tracker.Fail(ConcernDockerSnapshot, "list failed")

@@ -53,6 +53,7 @@ type Record struct {
 
 // Snapshot is an immutable copy of the tracker's current state.
 type Snapshot struct {
+	Ready   bool
 	Active  map[Concern]uint64
 	History []Record
 }
@@ -60,6 +61,7 @@ type Snapshot struct {
 // Tracker stores current concerns and a bounded diagnostic history.
 type Tracker struct {
 	mu      sync.RWMutex
+	ready   bool
 	active  map[Concern]uint64
 	history []Record
 	nextID  uint64
@@ -74,10 +76,27 @@ func NewTracker() *Tracker {
 
 func newTracker(max int, now func() time.Time) *Tracker {
 	return &Tracker{
+		ready:  true,
 		active: make(map[Concern]uint64),
 		max:    max,
 		now:    now,
 	}
+}
+
+// BeginInitialization marks the daemon as unready without creating a diagnostic record.
+func (t *Tracker) BeginInitialization() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.ready = false
+}
+
+// CompleteInitialization marks the daemon as ready to serve its reconciled state.
+func (t *Tracker) CompleteInitialization() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.ready = true
 }
 
 // Fail replaces concern's active record and retains the failed observation.
@@ -114,6 +133,7 @@ func (t *Tracker) Snapshot() Snapshot {
 	defer t.mu.RUnlock()
 
 	return Snapshot{
+		Ready:   t.ready,
 		Active:  maps.Clone(t.active),
 		History: append([]Record(nil), t.history...),
 	}

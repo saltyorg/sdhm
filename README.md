@@ -131,7 +131,7 @@ Response:
 }
 ```
 
-The endpoint returns HTTP 200 only when no concern is currently active and HTTP 503 while Docker snapshots, event streaming, hosts updates, or recovery remain failed. A concern clears only after that same operation succeeds; elapsed time alone never marks it recovered. Up to ten historical records remain available for diagnosis, so `error_count` is retained history rather than the number of active concerns. Active records use `unknown` recovery fields, while superseded or recovered records use `0s`.
+From the moment the listener starts, the endpoint returns HTTP 503 with `message: "System initializing"` until hosts preparation and the first reconciliation attempt have completed. This readiness gate does not add an error record. After initialization, the endpoint returns HTTP 200 only when no concern is currently active and HTTP 503 while Docker snapshots, event streaming, hosts updates, or recovery remain failed. A failed first reconciliation therefore stays at 503 under its actual Docker or hosts concern. A concern clears only after that same operation succeeds; elapsed time alone never marks it recovered. Up to ten historical records remain available for diagnosis, so `error_count` is retained history rather than the number of active concerns. Active records use `unknown` recovery fields, while superseded or recovered records use `0s`.
 
 ## Running as a System Service
 
@@ -175,7 +175,7 @@ sudo journalctl -u sdhm -f
 
 ## How It Works
 
-1. **Startup**: SDHM pings Docker, binds the health listener, and validates or prepares the managed hosts section before starting background work
+1. **Startup**: SDHM pings Docker, binds the health listener in an initializing 503 state, validates or prepares the managed hosts section, and attempts one authoritative reconciliation before reporting readiness or starting background work
 2. **Discovery**: One authoritative list/inspect pass gathers every publishable endpoint on the configured networks. Container-list or non-not-found inspect failures preserve the current hosts file, while endpoints without usable settings, an IP address, or aliases are omitted because they have no valid hosts mapping. In the verified crash-loop case, Docker kept the restarting container listed while clearing its IP, so omission prevents it from blocking healthy updates
 3. **Scheduling**: Network events are debounced, periodic validation requests immediate reconciliation, and failed work retries with bounded backoff
 4. **Hosts File Update**: The complete publishable snapshot replaces one managed section while preserving every byte outside it:

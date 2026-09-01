@@ -49,7 +49,7 @@ func renderSnapshot(snapshot Snapshot) healthResponse {
 	}
 
 	response := healthResponse{
-		Healthy:    len(activeIDs) == 0,
+		Healthy:    snapshot.Ready && len(activeIDs) == 0,
 		ErrorCount: len(snapshot.History),
 		Errors:     make([]responseRecord, 0, len(snapshot.History)),
 	}
@@ -72,6 +72,14 @@ func renderSnapshot(snapshot Snapshot) healthResponse {
 			RecoveryPeriod:     recovery,
 			TimeUntilRecovered: recovery,
 		})
+	}
+
+	if !snapshot.Ready {
+		response.Status = "degraded"
+		response.Message = "System initializing"
+		response.Reason = "initialization has not completed"
+		response.TimeUntilHealthy = unknownRecovery
+		return response
 	}
 
 	if response.Healthy {

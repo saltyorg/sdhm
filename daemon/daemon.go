@@ -97,6 +97,7 @@ func (d *Daemon) Run(parent context.Context) error {
 		return finish(nil, false)
 	}
 
+	d.tracker.BeginInitialization()
 	if err := d.server.Start(); err != nil {
 		var runErr error
 		if parent.Err() == nil {
@@ -133,6 +134,9 @@ func (d *Daemon) Run(parent context.Context) error {
 	}
 
 	initialReconcileErr := d.reconcile(ctx)
+	if parent.Err() == nil && ctx.Err() == nil {
+		d.tracker.CompleteInitialization()
+	}
 	if initialReconcileErr != nil && parent.Err() == nil && ctx.Err() == nil {
 		d.logger.Warn("initial reconciliation failed", "err", initialReconcileErr)
 	}

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"slices"
 	"strings"
@@ -40,8 +42,11 @@ type orderedSource struct {
 	snapshotErr    error
 	closeErr       error
 	endpoints      []Endpoint
+	events         <-chan Event
+	eventErrors    <-chan error
 	onPing         func(context.Context)
 	onSnapshot     func(context.Context)
+	onEvents       func(context.Context, []string)
 	onClose        func()
 	mutateNetworks func([]string)
 
@@ -80,8 +85,11 @@ func (s *orderedSource) Snapshot(ctx context.Context, networks []string) ([]Endp
 	return cloneEndpoints(s.endpoints), nil
 }
 
-func (*orderedSource) Events(context.Context, []string) (<-chan Event, <-chan error) {
-	return nil, nil
+func (s *orderedSource) Events(ctx context.Context, networks []string) (<-chan Event, <-chan error) {
+	if s.onEvents != nil {
+		s.onEvents(ctx, slices.Clone(networks))
+	}
+	return s.events, s.eventErrors
 }
 
 func (s *orderedSource) Close() error {
@@ -383,6 +391,156 @@ func TestRunSuccessfulStartupUsesExactOrderAndTimeouts(t *testing.T) {
 		t.Fatalf("Shutdown() received canceled context: %v", shutdownInputErrors[0])
 	}
 	assertDeadlineBetween(t, shutdownContexts[0], started.Add(shutdownTimeout), finished.Add(shutdownTimeout))
+}
+
+func TestRunReadinessWaitsForInitialReconciliation(t *testing.T) {
+	log := &operationLog{}
+	tracker := health.NewTracker()
+	startReady := make(chan bool, 1)
+	prepareStarted := make(chan struct{})
+	releasePrepare := make(chan struct{})
+	snapshotStarted := make(chan struct{})
+	releaseSnapshot := make(chan struct{})
+	applyStarted := make(chan struct{})
+	releaseApply := make(chan struct{})
+	loopStarted := make(chan struct{})
+	events := make(chan Event)
+	eventErrors := make(chan error)
+
+	source := &orderedSource{
+		log:         log,
+		events:      events,
+		eventErrors: eventErrors,
+		onSnapshot: func(ctx context.Context) {
+			close(snapshotStarted)
+			select {
+			case <-releaseSnapshot:
+			case <-ctx.Done():
+			}
+		},
+		onEvents: func(context.Context, []string) {
+			close(loopStarted)
+		},
+	}
+	store := &orderedStore{
+		log: log,
+		onPrepare: func(ctx context.Context) {
+			close(prepareStarted)
+			select {
+			case <-releasePrepare:
+			case <-ctx.Done():
+			}
+		},
+		onApply: func(ctx context.Context) {
+			close(applyStarted)
+			select {
+			case <-releaseApply:
+			case <-ctx.Done():
+			}
+		},
+	}
+	server := newOrderedHealthServer(log)
+	server.onStart = func() { startReady <- tracker.Snapshot().Ready }
+	ctx, cancel := context.WithCancel(t.Context())
+	daemon := mustNewDaemon(t, validConfig(), source, store, tracker, server)
+	result := make(chan error, 1)
+	go func() { result <- daemon.Run(ctx) }()
+
+	if <-startReady {
+		t.Fatal("tracker was ready when the health listener started")
+	}
+	<-prepareStarted
+	assertReadiness(t, tracker, false)
+	close(releasePrepare)
+	<-snapshotStarted
+	assertReadiness(t, tracker, false)
+	close(releaseSnapshot)
+	<-applyStarted
+	assertReadiness(t, tracker, false)
+	close(releaseApply)
+	<-loopStarted
+	assertReadiness(t, tracker, true)
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+}
+
+func TestRunInitialReconciliationFailureCompletesInitializationWithActiveConcern(t *testing.T) {
+	log := &operationLog{}
+	events := make(chan Event)
+	eventErrors := make(chan error)
+	loopStarted := make(chan struct{})
+	snapshotErr := errors.New("snapshot sentinel")
+	source := &orderedSource{
+		log:         log,
+		snapshotErr: snapshotErr,
+		events:      events,
+		eventErrors: eventErrors,
+		onEvents: func(context.Context, []string) {
+			close(loopStarted)
+		},
+	}
+	tracker := health.NewTracker()
+	ctx, cancel := context.WithCancel(t.Context())
+	daemon := mustNewDaemon(
+		t,
+		validConfig(),
+		source,
+		&orderedStore{log: log},
+		tracker,
+		newOrderedHealthServer(log),
+	)
+	result := make(chan error, 1)
+	go func() { result <- daemon.Run(ctx) }()
+
+	<-loopStarted
+	assertReadiness(t, tracker, true)
+	assertActiveConcerns(t, tracker, health.ConcernDockerSnapshot)
+	recorder := httptest.NewRecorder()
+	health.NewHandler(tracker).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("health status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+}
+
+func TestRunCancellationDuringInitialReconciliationDoesNotMarkReady(t *testing.T) {
+	log := &operationLog{}
+	snapshotStarted := make(chan struct{})
+	source := &orderedSource{
+		log:         log,
+		snapshotErr: context.Canceled,
+		onSnapshot: func(ctx context.Context) {
+			close(snapshotStarted)
+			<-ctx.Done()
+		},
+	}
+	tracker := health.NewTracker()
+	ctx, cancel := context.WithCancel(t.Context())
+	daemon := mustNewDaemon(
+		t,
+		validConfig(),
+		source,
+		&orderedStore{log: log},
+		tracker,
+		newOrderedHealthServer(log),
+	)
+	result := make(chan error, 1)
+	go func() { result <- daemon.Run(ctx) }()
+
+	<-snapshotStarted
+	assertReadiness(t, tracker, false)
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	assertReadiness(t, tracker, false)
 }
 
 func TestReconcilePassesCompleteSnapshotAndUpdatesExactHealthConcerns(t *testing.T) {
@@ -921,6 +1079,13 @@ func assertActiveConcerns(t *testing.T, tracker *health.Tracker, want ...health.
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
 		t.Fatalf("active health concerns = %v, want %v", got, want)
+	}
+}
+
+func assertReadiness(t *testing.T, tracker *health.Tracker, want bool) {
+	t.Helper()
+	if got := tracker.Snapshot().Ready; got != want {
+		t.Fatalf("health readiness = %t, want %t", got, want)
 	}
 }
 

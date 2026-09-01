@@ -45,6 +45,31 @@ func TestTrackerTransitions(t *testing.T) {
 	}
 }
 
+func TestTrackerInitializationIsTransientState(t *testing.T) {
+	tracker := NewTracker()
+	if !tracker.Snapshot().Ready {
+		t.Fatal("new tracker is not ready by default")
+	}
+
+	tracker.BeginInitialization()
+	initializing := tracker.Snapshot()
+	if initializing.Ready {
+		t.Fatal("tracker is ready during initialization")
+	}
+	if len(initializing.Active) != 0 || len(initializing.History) != 0 {
+		t.Fatalf("initialization created diagnostic records: %+v", initializing)
+	}
+
+	tracker.CompleteInitialization()
+	initialized := tracker.Snapshot()
+	if !initialized.Ready {
+		t.Fatal("tracker is not ready after initialization completes")
+	}
+	if len(initialized.Active) != 0 || len(initialized.History) != 0 {
+		t.Fatalf("initialization completion created diagnostic records: %+v", initialized)
+	}
+}
+
 func TestTrackerConcernMappings(t *testing.T) {
 	tests := []struct {
 		concern   Concern
