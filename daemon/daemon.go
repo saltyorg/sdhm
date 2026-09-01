@@ -121,15 +121,16 @@ func (d *Daemon) Run(parent context.Context) error {
 		return d.cleanup(serverStarted, runErr, captured)
 	}
 
-	if err := d.reconcile(ctx); err != nil && parent.Err() == nil {
-		d.logger.Warn("initial reconciliation failed", "err", err)
+	initialReconcileErr := d.reconcile(ctx)
+	if initialReconcileErr != nil && parent.Err() == nil {
+		d.logger.Warn("initial reconciliation failed", "err", initialReconcileErr)
 	}
 	if runErr, captured, stop := d.startupStop(parent); stop {
 		cancel()
 		return d.cleanup(serverStarted, runErr, captured)
 	}
 
-	runErr, serveErrCaptured := d.loop(ctx)
+	runErr, serveErrCaptured := d.loop(ctx, cancel, initialReconcileErr != nil)
 	cancel()
 	return d.cleanup(serverStarted, runErr, serveErrCaptured)
 }
@@ -169,19 +170,6 @@ func (d *Daemon) startupStop(parent context.Context) (error, bool, bool) {
 		return errHealthServerStopped, true, true
 	default:
 		return nil, false, false
-	}
-}
-
-func (d *Daemon) loop(ctx context.Context) (error, bool) {
-	select {
-	case <-ctx.Done():
-		return nil, false
-	case <-d.server.Done():
-		serveErr := d.server.Err()
-		if serveErr != nil {
-			return fmt.Errorf("health server stopped: %w", serveErr), true
-		}
-		return errHealthServerStopped, true
 	}
 }
 
