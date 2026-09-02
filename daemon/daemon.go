@@ -143,15 +143,22 @@ func (d *Daemon) Run(parent context.Context) error {
 	}
 	if parent.Err() == nil && ctx.Err() == nil {
 		d.tracker.CompleteInitialization()
-	}
-	if initialReconcileErr != nil && parent.Err() == nil && ctx.Err() == nil {
-		d.logger.Warn("initial reconciliation failed", "err", initialReconcileErr)
+		if initialReconcileErr == nil {
+			d.logger.Info("SDHM ready")
+		} else {
+			d.logger.Warn(
+				"reconciliation failed",
+				"phase", "initial",
+				"err", initialReconcileErr,
+				"retry_in", d.timing.retryInitialDelay,
+			)
+		}
 	}
 	if runErr, captured, stop := d.startupStop(parent); stop {
 		return finish(runErr, captured)
 	}
 
-	runErr, serveErrCaptured := d.loop(ctx, initialReconcileErr != nil)
+	runErr, serveErrCaptured := d.loop(ctx, initialReconcileErr)
 	return finish(runErr, serveErrCaptured)
 }
 

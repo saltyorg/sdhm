@@ -535,6 +535,141 @@ func TestRunInitialReconciliationFailureCompletesInitializationWithActiveConcern
 	}
 }
 
+func TestRunLogsReadyAfterSuccessfulInitialReconciliation(t *testing.T) {
+	log := &operationLog{}
+	loopStarted := make(chan struct{})
+	source := &orderedSource{
+		log:         log,
+		events:      make(chan Event),
+		eventErrors: make(chan error),
+		onEvents: func(context.Context, []string) {
+			close(loopStarted)
+		},
+	}
+	tracker := health.NewTracker()
+	recorder := newLogRecorder()
+	daemon, err := New(
+		validConfig(),
+		source,
+		&orderedStore{log: log},
+		tracker,
+		newOrderedHealthServer(log),
+		slog.New(recorder),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- daemon.Run(ctx) }()
+
+	<-loopStarted
+	assertReadiness(t, tracker, true)
+	if records := logRecords(recorder.Records(), slog.LevelInfo, "SDHM ready"); len(records) != 1 {
+		t.Fatalf("SDHM ready records = %d, want 1 after Apply returned", len(records))
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+}
+
+func TestRunLogsInitialReconciliationFailure(t *testing.T) {
+	log := &operationLog{}
+	failure := errors.New("snapshot sentinel")
+	loopStarted := make(chan struct{})
+	source := &orderedSource{
+		log:         log,
+		snapshotErr: failure,
+		events:      make(chan Event),
+		eventErrors: make(chan error),
+		onEvents: func(context.Context, []string) {
+			close(loopStarted)
+		},
+	}
+	recorder := newLogRecorder()
+	daemon, err := New(
+		validConfig(),
+		source,
+		&orderedStore{log: log},
+		health.NewTracker(),
+		newOrderedHealthServer(log),
+		slog.New(recorder),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- daemon.Run(ctx) }()
+
+	<-loopStarted
+	failures := logRecords(recorder.Records(), slog.LevelWarn, "reconciliation failed")
+	if len(failures) != 1 {
+		t.Fatalf("initial reconciliation failure records = %d, want 1", len(failures))
+	}
+	if got := logAttr(t, failures[0], "phase"); got.Kind() != slog.KindString || got.String() != "initial" {
+		t.Errorf("phase = %v, want initial", got)
+	}
+	if got := logAttr(t, failures[0], "err"); got.Kind() != slog.KindAny || !errors.Is(got.Any().(error), failure) {
+		t.Errorf("err = %v, want %v", got, failure)
+	}
+	if got := logAttr(t, failures[0], "retry_in"); got.Kind() != slog.KindDuration || got.Duration() != retryInitialDelay {
+		t.Errorf("retry_in = %v, want %v", got, retryInitialDelay)
+	}
+	if records := logRecords(recorder.Records(), slog.LevelInfo, "SDHM ready"); len(records) != 0 {
+		t.Fatalf("SDHM ready records = %d, want 0", len(records))
+	}
+
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+}
+
+func TestRunLogsCancellationDuringInitialReconciliation(t *testing.T) {
+	log := &operationLog{}
+	snapshotStarted := make(chan struct{})
+	source := &orderedSource{
+		log:         log,
+		snapshotErr: context.Canceled,
+		onSnapshot: func(ctx context.Context) {
+			close(snapshotStarted)
+			<-ctx.Done()
+		},
+	}
+	recorder := newLogRecorder()
+	ctx, cancel := context.WithCancel(t.Context())
+	daemon, err := New(
+		validConfig(),
+		source,
+		&orderedStore{log: log},
+		health.NewTracker(),
+		newOrderedHealthServer(log),
+		slog.New(recorder),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- daemon.Run(ctx) }()
+
+	<-snapshotStarted
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if records := logRecords(recorder.Records(), slog.LevelInfo, "SDHM ready"); len(records) != 0 {
+		t.Fatalf("SDHM ready records = %d, want 0", len(records))
+	}
+	if records := logRecords(recorder.Records(), slog.LevelWarn, "reconciliation failed"); len(records) != 0 {
+		t.Fatalf("reconciliation failed records = %d, want 0", len(records))
+	}
+}
+
 func TestRunCancellationDuringInitialReconciliationDoesNotMarkReady(t *testing.T) {
 	log := &operationLog{}
 	snapshotStarted := make(chan struct{})
@@ -1167,8 +1302,20 @@ func mustNewDaemon(
 	tracker *health.Tracker,
 	server HealthServer,
 ) *Daemon {
+	return mustNewDaemonWithLogger(t, cfg, source, store, tracker, server, testLogger())
+}
+
+func mustNewDaemonWithLogger(
+	t *testing.T,
+	cfg Config,
+	source NetworkSource,
+	store HostStore,
+	tracker *health.Tracker,
+	server HealthServer,
+	logger *slog.Logger,
+) *Daemon {
 	t.Helper()
-	daemon, err := New(cfg, source, store, tracker, server, testLogger())
+	daemon, err := New(cfg, source, store, tracker, server, logger)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}

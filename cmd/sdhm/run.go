@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 
 	"github.com/saltyorg/sdhm/command"
 	"github.com/saltyorg/sdhm/daemon"
@@ -38,13 +39,19 @@ func runDaemon(ctx context.Context, cfg command.Config) error {
 	if os.Geteuid() != 0 {
 		logger.Warn("SDHM should run as root to modify the hosts file")
 	}
+	logStartup(logger, cfg)
+	return runDaemonWith(ctx, cfg, logger, productionDaemonWiring())
+}
+
+func logStartup(logger *slog.Logger, cfg command.Config) {
 	logger.Info(
 		"starting SDHM",
 		"version", version,
 		"networks", cfg.Networks,
 		"default_network", cfg.DefaultNetwork,
+		"interval", cfg.PeriodicInterval,
+		"health_addr", net.JoinHostPort(cfg.HealthAddr, strconv.Itoa(cfg.HealthPort)),
 	)
-	return runDaemonWith(ctx, cfg, logger, productionDaemonWiring())
 }
 
 func productionDaemonWiring() daemonWiring {
@@ -108,7 +115,11 @@ func runDaemonWith(ctx context.Context, cfg command.Config, logger *slog.Logger,
 		return errors.Join(constructionErr, closeErr)
 	}
 
-	return runner.Run(ctx)
+	if err := runner.Run(ctx); err != nil {
+		return err
+	}
+	logger.Info("SDHM stopped")
+	return nil
 }
 
 func regenerateHosts(ctx context.Context, cfg command.RegenerateConfig) error {

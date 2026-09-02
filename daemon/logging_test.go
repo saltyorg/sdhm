@@ -84,6 +84,48 @@ func (r *logRecorder) Records() []slog.Record {
 	return records
 }
 
+func logRecords(records []slog.Record, level slog.Level, message string) []slog.Record {
+	matching := make([]slog.Record, 0)
+	for _, record := range records {
+		if record.Level == level && record.Message == message {
+			matching = append(matching, record)
+		}
+	}
+	return matching
+}
+
+func logAttr(t *testing.T, record slog.Record, key string) slog.Value {
+	t.Helper()
+	var value slog.Value
+	found := false
+	record.Attrs(func(attr slog.Attr) bool {
+		if attr.Key == key {
+			value = attr.Value
+			found = true
+			return false
+		}
+		return true
+	})
+	if !found {
+		t.Fatalf("record %q is missing %q", record.Message, key)
+	}
+	return value
+}
+
+func logAttrIfPresent(record slog.Record, key string) (slog.Value, bool) {
+	var value slog.Value
+	found := false
+	record.Attrs(func(attr slog.Attr) bool {
+		if attr.Key == key {
+			value = attr.Value
+			found = true
+			return false
+		}
+		return true
+	})
+	return value, found
+}
+
 func (h *logRecordingHandler) Enabled(context.Context, slog.Level) bool {
 	return true
 }

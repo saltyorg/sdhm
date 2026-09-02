@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +23,97 @@ import (
 var _ daemon.NetworkSource = (*docker.Client)(nil)
 var _ daemon.HostStore = (*hosts.Store)(nil)
 var _ daemon.HealthServer = (*health.Server)(nil)
+
+func TestLogStartupIncludesRuntimeConfiguration(t *testing.T) {
+	cfg := validCommandConfig()
+	cfg.Networks = []string{"backend", "frontend"}
+	cfg.DefaultNetwork = "frontend"
+	cfg.PeriodicInterval = 7 * time.Minute
+	cfg.HealthAddr = "2001:db8::1"
+	cfg.HealthPort = 9090
+	recorder := newRunLogRecorder()
+
+	logStartup(slog.New(recorder), cfg)
+
+	records := recorder.Records()
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want 1", len(records))
+	}
+	record := records[0]
+	if record.Level != slog.LevelInfo || record.Message != "starting SDHM" {
+		t.Fatalf("record = (%v, %q), want INFO starting SDHM", record.Level, record.Message)
+	}
+	if got := runLogStringAttr(t, record, "version"); got != version {
+		t.Errorf("version = %q, want %q", got, version)
+	}
+	if got := runLogStringSliceAttr(t, record, "networks"); !slices.Equal(got, cfg.Networks) {
+		t.Errorf("networks = %q, want %q", got, cfg.Networks)
+	}
+	if got := runLogStringAttr(t, record, "default_network"); got != cfg.DefaultNetwork {
+		t.Errorf("default_network = %q, want %q", got, cfg.DefaultNetwork)
+	}
+	if got := runLogDurationAttr(t, record, "interval"); got != cfg.PeriodicInterval {
+		t.Errorf("interval = %v, want %v", got, cfg.PeriodicInterval)
+	}
+	wantHealthAddr := "[2001:db8::1]:" + strconv.Itoa(cfg.HealthPort)
+	if got := runLogStringAttr(t, record, "health_addr"); got != wantHealthAddr {
+		t.Errorf("health_addr = %q, want %q", got, wantHealthAddr)
+	}
+}
+
+func TestRunDaemonWithLogsCleanStop(t *testing.T) {
+	sentinel := errors.New("runner sentinel")
+	tests := []struct {
+		name      string
+		runnerErr error
+		wantStops int
+	}{
+		{name: "clean stop", wantStops: 1},
+		{name: "runner failure", runnerErr: sentinel},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := newRunLogRecorder()
+			wiring := daemonWiring{
+				newDocker: func() (daemon.NetworkSource, error) { return &wiringNetworkSource{}, nil },
+				newStore: func(string, string, string, string) daemon.HostStore {
+					return &wiringHostStore{}
+				},
+				newTracker: health.NewTracker,
+				newHandler: health.NewHandler,
+				newHealthServer: func(string, http.Handler) daemon.HealthServer {
+					return newWiringHealthServer()
+				},
+				newDaemon: func(
+					daemon.Config,
+					daemon.NetworkSource,
+					daemon.HostStore,
+					*health.Tracker,
+					daemon.HealthServer,
+					*slog.Logger,
+				) (daemonRunner, error) {
+					return daemonRunnerFunc(func(context.Context) error { return tt.runnerErr }), nil
+				},
+			}
+
+			err := runDaemonWith(t.Context(), validCommandConfig(), slog.New(recorder), wiring)
+			if err != tt.runnerErr {
+				t.Fatalf("runDaemonWith() error = %v, want exact %v", err, tt.runnerErr)
+			}
+
+			stops := 0
+			for _, record := range recorder.Records() {
+				if record.Level == slog.LevelInfo && record.Message == "SDHM stopped" {
+					stops++
+				}
+			}
+			if stops != tt.wantStops {
+				t.Fatalf("SDHM stopped records = %d, want %d", stops, tt.wantStops)
+			}
+		})
+	}
+}
 
 func TestRunDaemonWithWiresDependenciesInConstructionOrder(t *testing.T) {
 	cfg := command.Config{
@@ -260,6 +353,91 @@ type daemonRunnerFunc func(context.Context) error
 
 func (f daemonRunnerFunc) Run(ctx context.Context) error {
 	return f(ctx)
+}
+
+type runLogRecorder struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func newRunLogRecorder() *runLogRecorder {
+	return &runLogRecorder{}
+}
+
+func (*runLogRecorder) Enabled(context.Context, slog.Level) bool {
+	return true
+}
+
+func (r *runLogRecorder) Handle(_ context.Context, record slog.Record) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.records = append(r.records, record.Clone())
+	return nil
+}
+
+func (r *runLogRecorder) WithAttrs([]slog.Attr) slog.Handler {
+	return r
+}
+
+func (r *runLogRecorder) WithGroup(string) slog.Handler {
+	return r
+}
+
+func (r *runLogRecorder) Records() []slog.Record {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	records := make([]slog.Record, len(r.records))
+	for i, record := range r.records {
+		records[i] = record.Clone()
+	}
+	return records
+}
+
+func runLogAttr(t *testing.T, record slog.Record, key string) slog.Value {
+	t.Helper()
+	var value slog.Value
+	found := false
+	record.Attrs(func(attr slog.Attr) bool {
+		if attr.Key == key {
+			value = attr.Value
+			found = true
+			return false
+		}
+		return true
+	})
+	if !found {
+		t.Fatalf("record %q is missing %q", record.Message, key)
+	}
+	return value
+}
+
+func runLogStringAttr(t *testing.T, record slog.Record, key string) string {
+	t.Helper()
+	value := runLogAttr(t, record, key)
+	if value.Kind() != slog.KindString {
+		t.Fatalf("record %q %s kind = %v, want string", record.Message, key, value.Kind())
+	}
+	return value.String()
+}
+
+func runLogStringSliceAttr(t *testing.T, record slog.Record, key string) []string {
+	t.Helper()
+	value := runLogAttr(t, record, key)
+	networks, ok := value.Any().([]string)
+	if !ok {
+		t.Fatalf("record %q %s = %T, want []string", record.Message, key, value.Any())
+	}
+	return networks
+}
+
+func runLogDurationAttr(t *testing.T, record slog.Record, key string) time.Duration {
+	t.Helper()
+	value := runLogAttr(t, record, key)
+	if value.Kind() != slog.KindDuration {
+		t.Fatalf("record %q %s kind = %v, want duration", record.Message, key, value.Kind())
+	}
+	return value.Duration()
 }
 
 type wiringNetworkSource struct {

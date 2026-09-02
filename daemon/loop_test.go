@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -152,6 +153,7 @@ type loopTestHarness struct {
 	stream   loopTestStream
 	server   *orderedHealthServer
 	daemon   *Daemon
+	recorder *logRecorder
 	cancel   context.CancelFunc
 	result   chan error
 	stopOnce sync.Once
@@ -177,13 +179,15 @@ func newLoopTestHarnessWith(
 	source.streams <- stream
 	log := &operationLog{}
 	server := newOrderedHealthServer(log)
-	daemon := mustNewDaemon(
+	recorder := newLogRecorder()
+	daemon := mustNewDaemonWithLogger(
 		t,
 		cfg,
 		source,
 		store,
 		tracker,
 		server,
+		slog.New(recorder),
 	)
 	if configure != nil {
 		configure(daemon)
@@ -193,12 +197,13 @@ func newLoopTestHarnessWith(
 	go func() { result <- daemon.Run(ctx) }()
 
 	return &loopTestHarness{
-		source: source,
-		stream: stream,
-		server: server,
-		daemon: daemon,
-		cancel: cancel,
-		result: result,
+		source:   source,
+		stream:   stream,
+		server:   server,
+		daemon:   daemon,
+		recorder: recorder,
+		cancel:   cancel,
+		result:   result,
 	}
 }
 
@@ -421,6 +426,129 @@ func TestLoopRetryBackoffDoublesAndResetsAfterSuccess(t *testing.T) {
 		}
 		synctest.Wait()
 		assertActiveConcerns(t, tracker)
+	})
+}
+
+func TestLoopLogsReconciliationTransitions(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := loopTestConfig()
+		source := newLoopTestSource()
+		tracker := health.NewTracker()
+		firstFailure := errors.New("snapshot unavailable")
+		sameFailure := errors.New("snapshot unavailable")
+		changedFailure := errors.New("snapshot denied")
+		source.snapshotResults <- firstFailure
+		source.snapshotResults <- sameFailure
+		source.snapshotResults <- changedFailure
+		harness := newLoopTestHarnessWith(t, cfg, source, newLoopTestStore(), tracker, nil)
+		defer harness.stop(t)
+		harness.start(t)
+
+		initialFailures := logRecords(harness.recorder.Records(), slog.LevelWarn, "reconciliation failed")
+		if len(initialFailures) != 1 {
+			t.Fatalf("initial reconciliation failures = %d, want 1", len(initialFailures))
+		}
+		if got := logAttr(t, initialFailures[0], "phase"); got.Kind() != slog.KindString || got.String() != "initial" {
+			t.Errorf("initial phase = %v, want initial", got)
+		}
+		if got := logAttr(t, initialFailures[0], "retry_in"); got.Kind() != slog.KindDuration || got.Duration() != retryInitialDelay {
+			t.Errorf("initial retry_in = %v, want %v", got, retryInitialDelay)
+		}
+
+		receiveLoopValue(t, source.snapshots, "identical reconciliation retry")
+		synctest.Wait()
+		if history := tracker.Snapshot().History; len(history) != 2 {
+			t.Fatalf("health history after identical retry = %d, want 2", len(history))
+		}
+		if failures := logRecords(harness.recorder.Records(), slog.LevelWarn, "reconciliation failed"); len(failures) != 1 {
+			t.Fatalf("reconciliation failures after identical retry = %d, want 1", len(failures))
+		}
+
+		receiveLoopValue(t, source.snapshots, "changed reconciliation retry")
+		synctest.Wait()
+		failures := logRecords(harness.recorder.Records(), slog.LevelWarn, "reconciliation failed")
+		if len(failures) != 2 {
+			t.Fatalf("reconciliation failures after changed retry = %d, want 2", len(failures))
+		}
+		if got := logAttr(t, failures[1], "err"); got.Kind() != slog.KindAny || !errors.Is(got.Any().(error), changedFailure) {
+			t.Errorf("changed retry err = %v, want %v", got, changedFailure)
+		}
+		if got := logAttr(t, failures[1], "retry_in"); got.Kind() != slog.KindDuration || got.Duration() != 4*time.Second {
+			t.Errorf("changed retry_in = %v, want %v", got, 4*time.Second)
+		}
+
+		receiveLoopValue(t, source.snapshots, "successful reconciliation retry")
+		synctest.Wait()
+		if recovered := logRecords(harness.recorder.Records(), slog.LevelInfo, "reconciliation recovered"); len(recovered) != 1 {
+			t.Fatalf("reconciliation recovered records = %d, want 1", len(recovered))
+		}
+
+		harness.stream.events <- Event{Action: "connect", Network: "saltbox"}
+		receiveLoopValue(t, source.snapshots, "later healthy reconciliation")
+		synctest.Wait()
+		if recovered := logRecords(harness.recorder.Records(), slog.LevelInfo, "reconciliation recovered"); len(recovered) != 1 {
+			t.Fatalf("reconciliation recovered records after healthy reconciliation = %d, want 1", len(recovered))
+		}
+	})
+}
+
+func TestLoopLogsFirstRuntimeReconciliationFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		source := newLoopTestSource()
+		failure := errors.New("snapshot unavailable")
+		harness := newLoopTestHarnessWith(t, loopTestConfig(), source, newLoopTestStore(), health.NewTracker(), nil)
+		defer harness.stop(t)
+		harness.start(t)
+
+		source.snapshotResults <- failure
+		harness.stream.events <- Event{Action: "connect", Network: "saltbox"}
+		receiveLoopValue(t, source.snapshots, "first failed runtime reconciliation")
+		synctest.Wait()
+
+		failures := logRecords(harness.recorder.Records(), slog.LevelWarn, "reconciliation failed")
+		if len(failures) != 1 {
+			t.Fatalf("runtime reconciliation failures = %d, want 1", len(failures))
+		}
+		if got := logAttr(t, failures[0], "err"); got.Kind() != slog.KindAny || !errors.Is(got.Any().(error), failure) {
+			t.Errorf("runtime err = %v, want %v", got, failure)
+		}
+		if got := logAttr(t, failures[0], "retry_in"); got.Kind() != slog.KindDuration || got.Duration() != retryInitialDelay {
+			t.Errorf("runtime retry_in = %v, want %v", got, retryInitialDelay)
+		}
+		if _, present := logAttrIfPresent(failures[0], "phase"); present {
+			t.Fatal("runtime reconciliation failure has initial-only phase")
+		}
+	})
+}
+
+func TestLoopLogsCancellationDuringReconciliation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		source := newLoopTestSource()
+		initialFailure := errors.New("initial snapshot unavailable")
+		source.snapshotResults <- initialFailure
+		retryStarted := make(chan struct{}, 1)
+		source.onSnapshot = func(ctx context.Context, call int) {
+			if call != 2 {
+				return
+			}
+			retryStarted <- struct{}{}
+			<-ctx.Done()
+		}
+		harness := newLoopTestHarnessWith(t, loopTestConfig(), source, newLoopTestStore(), health.NewTracker(), nil)
+		harness.start(t)
+
+		receiveLoopValue(t, retryStarted, "blocked reconciliation retry")
+		harness.cancel()
+		if err := harness.wait(t); err != nil {
+			t.Fatalf("Run() error = %v, want nil", err)
+		}
+
+		if failures := logRecords(harness.recorder.Records(), slog.LevelWarn, "reconciliation failed"); len(failures) != 1 {
+			t.Fatalf("reconciliation failures after cancellation = %d, want only initial failure", len(failures))
+		}
+		if recovered := logRecords(harness.recorder.Records(), slog.LevelInfo, "reconciliation recovered"); len(recovered) != 0 {
+			t.Fatalf("reconciliation recoveries after cancellation = %d, want 0", len(recovered))
+		}
 	})
 }
 

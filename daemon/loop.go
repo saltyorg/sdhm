@@ -13,7 +13,7 @@ const eventStreamClosedMessage = "Docker event stream closed"
 
 func (d *Daemon) loop(
 	ctx context.Context,
-	initialReconcileFailed bool,
+	initialReconcileErr error,
 ) (error, bool) {
 	periodicTimer := time.NewTimer(d.config.PeriodicInterval)
 	var debounceTimer *time.Timer
@@ -24,7 +24,9 @@ func (d *Daemon) loop(
 	retryDelay := d.timing.retryInitialDelay
 	reconnectDelay := d.timing.retryInitialDelay
 	pending := false
-	if initialReconcileFailed {
+	lastReconcileFailure := ""
+	if initialReconcileErr != nil {
+		lastReconcileFailure = initialReconcileErr.Error()
 		retryTimer = resetLoopTimer(retryTimer, retryDelay)
 		retryDelay = nextLoopBackoff(retryDelay, d.timing.retryMaxDelay)
 	}
@@ -110,13 +112,22 @@ func (d *Daemon) loop(
 			}
 			if reconcileErr != nil {
 				if ctx.Err() == nil {
-					d.logger.Warn("reconciliation failed", "err", reconcileErr)
+					if reconcileErr.Error() != lastReconcileFailure {
+						d.logger.Warn("reconciliation failed", "err", reconcileErr, "retry_in", retryDelay)
+						lastReconcileFailure = reconcileErr.Error()
+					}
 					retryTimer = resetLoopTimer(retryTimer, retryDelay)
 					retryDelay = nextLoopBackoff(retryDelay, d.timing.retryMaxDelay)
 				}
 				continue
 			}
-			retryDelay = d.timing.retryInitialDelay
+			if ctx.Err() == nil {
+				retryDelay = d.timing.retryInitialDelay
+				if lastReconcileFailure != "" {
+					d.logger.Info("reconciliation recovered")
+					lastReconcileFailure = ""
+				}
+			}
 			continue
 		}
 
