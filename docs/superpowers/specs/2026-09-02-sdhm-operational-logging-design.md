@@ -1,7 +1,7 @@
 # SDHM Operational Logging Design
 
 Date: 2026-09-02
-Status: Implemented; acceptance pending
+Status: Implemented and qualified 2026-09-02
 
 ## Purpose
 
@@ -9,9 +9,9 @@ Make every actionable SDHM failure, recovery, and lifecycle transition visible i
 
 ## Implementation Status
 
-The implementation through `2eeef4cdd234da4c9bc3258b124f5496ba2711bc` supplies the process, daemon, and storage transitions defined below. Local tests cover record levels, messages, fields, suppression, rollback wording, cancellation behavior, and process priority-prefix formatting.
+The implementation through reviewed head `1e725d1283a05c8776415ce8422b8025f8a79cc5` supplies the process, daemon, and storage transitions defined below. Local tests cover record levels, messages, fields, suppression, rollback wording, cancellation behavior, and process priority-prefix formatting.
 
-Native priority behavior has not yet been qualified in a live systemd journal, and no Saltbox VM evidence is claimed here. The pending acceptance procedure remains in this document and in the implementation plan.
+The native-priority mapping and transition contract were qualified on 2026-09-02 in an Ubuntu 26.04 `minimal` guest using isolated synthetic networks and temporary hosts files. This is not a real Saltbox deployment or a `core`-profile qualification; the evidence and its exact boundary are recorded below.
 
 The live v1.0.4 journal established the noise that must not return: unmonitored bridge events, container-name lookup solely for logging, every monitored event, and every successful hosts update.
 
@@ -82,7 +82,7 @@ No public CLI option or dynamic log-level configuration is added.
 
 The handler delegates formatting, attributes, groups, and minimum-level behavior to standard `slog.TextHandler` instances. A shared writer mutex keeps the prefix and complete record atomic across levels. `WithAttrs` and `WithGroup` return cloned wrappers around the corresponding delegated handlers.
 
-The process-boundary terminal error writer uses `<3>` only when `JOURNAL_STREAM` is present. Interactive execution keeps the current unprefixed output. This requires no third-party dependency and no Saltbox template change; historical systemd units retain the default prefix parser. This behavior is locally tested; the live parser configuration and resulting `PRIORITY` values remain acceptance-pending.
+The process-boundary terminal error writer uses `<3>` only when `JOURNAL_STREAM` is present. Interactive execution keeps the current unprefixed output. This requires no third-party dependency and no Saltbox template change; historical systemd units retain the default prefix parser. Local tests cover the prefix formatter, and the qualification below demonstrates the parser configuration and resulting `PRIORITY` values.
 
 Implementation must follow the official Go `slog.Handler` contract and its concurrency rules: <https://pkg.go.dev/golang.org/x/example/slog-handler-guide>. Systemd stream behavior is defined by `SyslogLevel=` and `SyslogLevelPrefix=` in the official execution manual: <https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html>.
 
@@ -116,6 +116,17 @@ Use an Ubuntu 26.04 `minimal` Saltbox VM with isolated synthetic networks and te
 6. Clean SIGTERM producing `SDHM stopped`, no later file mutation, and no remaining process.
 
 All fixtures are removed and the VM is destroyed after success. This logging-specific qualification supplements rather than relabels the existing composite Saltbox acceptance evidence.
+
+## Qualification Evidence
+
+- Reviewed head: `1e725d1283a05c8776415ce8422b8025f8a79cc5`; static stripped linux/amd64 artifact SHA-256: `3a2dcbd7ada7c9d07751be6609af3af9e42c81e5b4e0022d5c100a3599dbb76a`; exact version: `sdhm version 0.0.0-dev`.
+- Environment: Ubuntu 26.04 `minimal` guest `49dcbf99c8a46e0a6e2ac3831ee2cc2e30975231f4e58e1ae7468fa261aaf040`, isolated synthetic `saltbox` and `sdhm-extra` networks, and temporary hosts/backup files. Each transient unit reported `SyslogLevelPrefix=yes` without an injected property.
+- PASS assertions: one startup and ready record at `PRIORITY=6`; a topology-stable fixed-timeout Docker pause produced one reconciliation warning at `PRIORITY=4`, then one recovery at `PRIORITY=6` after PID-fenced resume with unchanged hosts and topology; validated marker repair produced one warning at `PRIORITY=4`, then ready/HTTP 200; standalone stream loss produced one warning at `PRIORITY=4` and one stable-evidence recovery at `PRIORITY=6` with no per-event or container-name record; invalid `--health-port 0` produced one priority-3 record without usage; and direct SIGTERM produced `SDHM stopped` at priority 6, exit zero in 4 ms, and no later hosts mutation.
+- Retained harness SHA-256: `8bbe3840ca13527a5bbedb2b388022cb4e22686b9d857027502f57eb0c5fb657`. Final evidence comprises a verified 71-file manifest, deterministic tree SHA-256 `1aa5aaa95cecc230876fd98bfc066d227a00340dc101af12064ab380c2d34f53`, and report SHA-256 `3c1ffb6be1a177ea81bd0d6b5f5aaef098ff8f8e94e7516419751e76ae55e967`.
+- Attempt 1 (tree SHA-256 `99b417698efcf3d80bf664d023c22daf9c6fe0376a0662e1ea61aa612a135f96`) over-counted the legitimate reconciliation transitions that followed Docker restart; attempt 2 (tree SHA-256 `b99f38f8c316c185cd33d8b5aed4a9a85bcd64c15b65ca19fcac8489904cf976`) misread nanosecond fractional output as milliseconds and lacked JSONL slurping in two diagnostic predicates. Both were harness-only outcomes, cleaned before the PASS run, and do not represent product failures.
+- Root coordinator destroy operation `594a1bb4-37c6-4593-8855-5d482ce58f03` removed the guest. Final helper inspection was overall healthy with `test-a`, `test-b`, and `proxmox-runner` absent.
+
+This qualifies the documented logging transitions in the stated minimal synthetic environment only. It does not claim a real Saltbox service run, a `core`-profile run, a Saltbox template change, or broader release qualification.
 
 ## Compatibility
 
