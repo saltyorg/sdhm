@@ -140,6 +140,9 @@ func (d *Daemon) loop(
 			maximumTimer = stopLoopTimer(maximumTimer)
 			retryTimer = stopLoopTimer(retryTimer)
 			reconcileErr := d.reconcile(ctx)
+			if streamStopReady() {
+				continue
+			}
 			if ctx.Err() == nil {
 				periodicTimer = resetLoopTimer(periodicTimer, d.config.PeriodicInterval)
 			}

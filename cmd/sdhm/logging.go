@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -95,7 +96,8 @@ func journalStreamPresent() bool {
 
 func writeProcessError(out io.Writer, journal bool, err error) {
 	if journal {
-		_, _ = fmt.Fprintf(out, "<3>%v\n", err)
+		message := strings.NewReplacer("\r\n", "; ", "\r", "; ", "\n", "; ").Replace(err.Error())
+		_, _ = fmt.Fprintf(out, "<3>%s\n", message)
 		return
 	}
 	_, _ = fmt.Fprintln(out, err)

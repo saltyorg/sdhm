@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"sync"
@@ -28,6 +29,11 @@ type loopTestStreamCall struct {
 type loopTestStream struct {
 	events chan Event
 	errors chan error
+}
+
+type loopTestResult struct {
+	err              error
+	serveErrCaptured bool
 }
 
 type loopTestSource struct {
@@ -548,6 +554,142 @@ func TestLoopLogsCancellationDuringReconciliation(t *testing.T) {
 		}
 		if recovered := logRecords(harness.recorder.Records(), slog.LevelInfo, "reconciliation recovered"); len(recovered) != 0 {
 			t.Fatalf("reconciliation recoveries after cancellation = %d, want 0", len(recovered))
+		}
+	})
+}
+
+func TestLoopHealthServerStopDuringFailedRuntimeReconciliationSuppressesTransition(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := loopTestConfig()
+		source := newLoopTestSource()
+		store := newLoopTestStore()
+		tracker := health.NewTracker()
+		stream := newLoopTestStream()
+		source.streams <- stream
+		server := newOrderedHealthServer(&operationLog{})
+		recorder := newLogRecorder()
+		failure := errors.New("runtime snapshot failure")
+		serveErr := errors.New("serve failure during runtime snapshot")
+		source.onSnapshot = func(_ context.Context, call int) {
+			if call == 1 {
+				server.finish(serveErr)
+			}
+		}
+		source.snapshotResults <- failure
+		daemon := mustNewDaemonWithLogger(t, cfg, source, store, tracker, server, slog.New(recorder))
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		result := make(chan loopTestResult, 1)
+		go func() {
+			err, captured := daemon.loop(ctx, nil)
+			result <- loopTestResult{err: err, serveErrCaptured: captured}
+		}()
+		receiveLoopValue(t, source.streamCalls, "initial event stream")
+
+		stream.events <- Event{Action: "connect", Network: "saltbox"}
+		receiveLoopValue(t, source.snapshots, "failed reconciliation that stops the health server")
+
+		got := receiveLoopValue(t, result, "loop termination")
+		if !got.serveErrCaptured || !errors.Is(got.err, serveErr) || got.err.Error() != "health server stopped: "+serveErr.Error() {
+			t.Fatalf("loop result = (%v, captured %t), want health server classification wrapping %v", got.err, got.serveErrCaptured, serveErr)
+		}
+		if failures := logRecords(recorder.Records(), slog.LevelWarn, "reconciliation failed"); len(failures) != 0 {
+			t.Fatalf("post-stop reconciliation failure records = %d, want 0", len(failures))
+		}
+		if recoveries := logRecords(recorder.Records(), slog.LevelInfo, "reconciliation recovered"); len(recoveries) != 0 {
+			t.Fatalf("post-stop reconciliation recovery records = %d, want 0", len(recoveries))
+		}
+
+		snapshot := tracker.Snapshot()
+		assertActiveConcerns(t, tracker, health.ConcernDockerSnapshot)
+		if !snapshot.Ready {
+			t.Fatal("health readiness = false, want completed initialization preserved")
+		}
+		if len(snapshot.History) != 1 || snapshot.History[0].Message != failure.Error() {
+			t.Fatalf("health history = %+v, want preserved runtime failure %q", snapshot.History, failure)
+		}
+
+		advanceLoopTime(t, cfg.PeriodicInterval+retryInitialDelay)
+		if calls := source.snapshotCount.Load(); calls != 1 {
+			t.Fatalf("Snapshot() calls = %d, want only the stopped runtime attempt", calls)
+		}
+		if calls := store.count.Load(); calls != 0 {
+			t.Fatalf("Apply() calls = %d, want none after failed snapshot", calls)
+		}
+		if calls := source.eventCallCount.Load(); calls != 1 {
+			t.Fatalf("Events() calls = %d, want no post-stop reconnect", calls)
+		}
+		_, _, errCalls := server.shutdownCalls()
+		if errCalls != 1 {
+			t.Fatalf("HealthServer.Err() calls = %d, want one terminal classification read", errCalls)
+		}
+	})
+}
+
+func TestLoopHealthServerStopDuringRecoveredRuntimeReconciliationSuppressesTransition(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := loopTestConfig()
+		source := newLoopTestSource()
+		store := newLoopTestStore()
+		tracker := health.NewTracker()
+		stream := newLoopTestStream()
+		source.streams <- stream
+		server := newOrderedHealthServer(&operationLog{})
+		recorder := newLogRecorder()
+		initialFailure := errors.New("initial snapshot failure")
+		initialReconcileErr := fmt.Errorf("snapshot Docker networks: %w", initialFailure)
+		serveErr := errors.New("serve failure during runtime recovery")
+		tracker.Fail(health.ConcernDockerSnapshot, initialFailure.Error())
+		store.onApply = func(_ context.Context, call int) error {
+			if call == 1 {
+				server.finish(serveErr)
+			}
+			return nil
+		}
+		daemon := mustNewDaemonWithLogger(t, cfg, source, store, tracker, server, slog.New(recorder))
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		result := make(chan loopTestResult, 1)
+		go func() {
+			err, captured := daemon.loop(ctx, initialReconcileErr)
+			result <- loopTestResult{err: err, serveErrCaptured: captured}
+		}()
+		receiveLoopValue(t, source.streamCalls, "initial event stream")
+		receiveLoopValue(t, source.snapshots, "successful reconciliation that stops the health server")
+
+		got := receiveLoopValue(t, result, "loop termination")
+		if !got.serveErrCaptured || !errors.Is(got.err, serveErr) || got.err.Error() != "health server stopped: "+serveErr.Error() {
+			t.Fatalf("loop result = (%v, captured %t), want health server classification wrapping %v", got.err, got.serveErrCaptured, serveErr)
+		}
+		if failures := logRecords(recorder.Records(), slog.LevelWarn, "reconciliation failed"); len(failures) != 0 {
+			t.Fatalf("post-stop reconciliation failure records = %d, want 0", len(failures))
+		}
+		if recoveries := logRecords(recorder.Records(), slog.LevelInfo, "reconciliation recovered"); len(recoveries) != 0 {
+			t.Fatalf("post-stop reconciliation recovery records = %d, want 0", len(recoveries))
+		}
+
+		snapshot := tracker.Snapshot()
+		assertActiveConcerns(t, tracker)
+		if !snapshot.Ready {
+			t.Fatal("health readiness = false, want completed initialization preserved")
+		}
+		if len(snapshot.History) != 1 || snapshot.History[0].Message != initialFailure.Error() {
+			t.Fatalf("health history = %+v, want retained initial failure %q", snapshot.History, initialFailure)
+		}
+
+		advanceLoopTime(t, cfg.PeriodicInterval+retryInitialDelay)
+		if calls := source.snapshotCount.Load(); calls != 1 {
+			t.Fatalf("Snapshot() calls = %d, want only the stopped recovery attempt", calls)
+		}
+		if calls := store.count.Load(); calls != 1 {
+			t.Fatalf("Apply() calls = %d, want only the completed recovery apply", calls)
+		}
+		if calls := source.eventCallCount.Load(); calls != 1 {
+			t.Fatalf("Events() calls = %d, want no post-stop reconnect", calls)
+		}
+		_, _, errCalls := server.shutdownCalls()
+		if errCalls != 1 {
+			t.Fatalf("HealthServer.Err() calls = %d, want one terminal classification read", errCalls)
 		}
 	})
 }

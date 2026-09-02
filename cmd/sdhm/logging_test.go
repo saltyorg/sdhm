@@ -119,23 +119,56 @@ func TestProcessLoggerWritesConcurrentRecordsAsCompleteLines(t *testing.T) {
 }
 
 func TestWriteProcessError(t *testing.T) {
-	err := errors.New("sentinel")
-
 	tests := []struct {
 		name    string
 		journal bool
+		err     error
 		want    string
 	}{
-		{"journal", true, "<3>sentinel\n"},
-		{"interactive", false, "sentinel\n"},
+		{
+			name:    "journal joined error",
+			journal: true,
+			err:     errors.Join(errors.New("primary"), errors.New("cleanup")),
+			want:    "<3>primary; cleanup\n",
+		},
+		{
+			name:    "journal mixed newlines",
+			journal: true,
+			err:     errors.New("first\r\nsecond\rthird\nfourth"),
+			want:    "<3>first; second; third; fourth\n",
+		},
+		{
+			name:    "interactive joined error",
+			journal: false,
+			err:     errors.Join(errors.New("primary"), errors.New("cleanup")),
+			want:    "primary\ncleanup\n",
+		},
+		{
+			name:    "interactive mixed newlines",
+			journal: false,
+			err:     errors.New("first\r\nsecond\rthird\nfourth"),
+			want:    "first\r\nsecond\rthird\nfourth\n",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var output bytes.Buffer
-			writeProcessError(&output, tt.journal, err)
+			writeProcessError(&output, tt.journal, tt.err)
 			if got := output.String(); got != tt.want {
-				t.Fatalf("writeProcessError() = %q, want %q", got, tt.want)
+				t.Errorf("writeProcessError() = %q, want %q", got, tt.want)
+			}
+			if tt.journal {
+				got := output.String()
+				if prefixes := strings.Count(got, "<3>"); prefixes != 1 {
+					t.Errorf("journal priority prefixes = %d, want 1 in %q", prefixes, got)
+				}
+				if terminators := strings.Count(got, "\n"); terminators != 1 {
+					t.Errorf("journal record terminators = %d, want 1 in %q", terminators, got)
+				}
+				if strings.ContainsRune(got, '\r') {
+					t.Errorf("journal output contains a carriage return: %q", got)
+				}
 			}
 		})
 	}
