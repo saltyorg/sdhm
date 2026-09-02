@@ -34,7 +34,7 @@ type daemonWiring struct {
 }
 
 func runDaemon(ctx context.Context, cfg command.Config) error {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger := newProcessLogger(os.Stdout, journalStreamPresent())
 	if os.Geteuid() != 0 {
 		logger.Warn("SDHM should run as root to modify the hosts file")
 	}
@@ -112,7 +112,7 @@ func runDaemonWith(ctx context.Context, cfg command.Config, logger *slog.Logger,
 }
 
 func regenerateHosts(ctx context.Context, cfg command.RegenerateConfig) error {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger := newProcessLogger(os.Stdout, journalStreamPresent())
 	if os.Geteuid() != 0 {
 		logger.Warn("SDHM should run as root to modify the hosts file")
 	}

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -18,7 +17,7 @@ func main() {
 
 	root := command.NewRoot(version, runDaemon, regenerateHosts)
 	if err := root.ExecuteContext(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		writeProcessError(os.Stderr, journalStreamPresent(), err)
 		os.Exit(1)
 	}
 }
