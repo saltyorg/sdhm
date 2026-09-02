@@ -351,7 +351,7 @@ git commit -m "feat(hosts): report recovery outcomes"
 Use the daemon recording handler to require:
 
 - successful initial reconciliation emits exactly one INFO `SDHM ready` after `Apply` returns and readiness becomes true;
-- initial failure emits WARN `initial reconciliation failed` with `err` and `retry_in=1s`, but no ready record;
+- initial failure emits WARN `reconciliation failed` with `phase=initial`, `err`, and `retry_in=1s`, but no ready record;
 - cancellation during initial reconciliation emits neither ready nor failure;
 - startup record includes `interval`, `health_addr`, existing network/default fields, and version.
 
@@ -411,7 +411,7 @@ if initialReconcileErr != nil {
 
 On failure, warn only when `reconcileErr.Error()` differs, then update the string. Include the delay used to reset the retry timer. On success, emit `reconciliation recovered` only when the string was non-empty, then clear it. Keep health failure recording on every observed failure.
 
-After a successful initial reconciliation and `CompleteInitialization`, log `SDHM ready`. Retain the existing initial warning for failure and add `retry_in=d.timing.retryInitialDelay`.
+After a successful initial reconciliation and `CompleteInitialization`, log `SDHM ready`. Replace the old initial-only message with the contract's stable `reconciliation failed` message and add `phase=initial` plus `retry_in=d.timing.retryInitialDelay`.
 
 In `runDaemonWith`, log `SDHM stopped` only after `runner.Run(ctx)` returns nil. Return non-nil errors without logging them.
 
@@ -510,6 +510,8 @@ git commit -m "feat(daemon): log event stream transitions"
 **Files:**
 - Modify: `README.md` logging/service sections
 - Modify: `docs/superpowers/specs/2026-09-01-sdhm-go-1.27-rewrite-design.md`
+- Modify: `docs/superpowers/specs/2026-09-02-sdhm-operational-logging-design.md`
+- Modify: `docs/superpowers/plans/2026-09-02-sdhm-operational-logging.md`
 - Modify: `docs/superpowers/reviews/2026-09-02-sdhm-go-1.27-rewrite-review.md`
 - Retain evidence under: `.superpowers/sdd/2026-09-01-sdhm-go-1.27-rewrite/`
 
@@ -528,7 +530,7 @@ Document the exact transition table from the logging spec, including:
 - successful automatic recovery warning and rollback wording;
 - readiness and clean-stop meanings.
 
-Update the original rewrite design's logging paragraph so it points to the operational logging spec. Add a short resolution entry to the written-spec review rather than rewriting its historical findings.
+Update the original rewrite design's logging paragraph so it points to the operational logging spec. Set the logging design status to `Implemented; acceptance pending`. Add a short resolution entry to the written-spec review rather than rewriting its historical findings.
 
 - [ ] **Step 2: Run the complete local gate**
 
@@ -598,7 +600,16 @@ Install PID-specific idempotent `SIGCONT` cleanup before pausing dockerd. Retain
 
 Remove transient units, containers, networks, temporary files, and payload. Verify Docker active and the assigned slot healthy on the same guest fence. Call `finish` with `passed`, require final state absent, then inspect the system and verify `test-a`, `test-b`, and `proxmox-runner` absent. On failure, finish with `failed` and preserve diagnostic state while needed.
 
-- [ ] **Step 9: Run final committed-head verification**
+- [ ] **Step 9: Record and commit qualification evidence**
+
+Update the logging design status to `Implemented and qualified 2026-09-02`. Append the exact reviewed commit, binary SHA-256, journal priority/message assertions, helper operation IDs, evidence hashes, and final absent slot state to the written review and ignored SDD ledger.
+
+```bash
+git add docs/superpowers/specs/2026-09-02-sdhm-operational-logging-design.md docs/superpowers/reviews/2026-09-02-sdhm-go-1.27-rewrite-review.md
+git commit -m "test(logging): qualify journal transitions"
+```
+
+- [ ] **Step 10: Run final committed-head verification**
 
 ```bash
 make check TEST_FLAGS='-count=1'
