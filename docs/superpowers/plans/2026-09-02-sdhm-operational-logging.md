@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-02-sdhm-operational-logging-design.md`
 
-**Implementation status:** The logging source contract is implemented through `2eeef4cdd234da4c9bc3258b124f5496ba2711bc`. Its canonical messages, fields, transition suppression, readiness and clean-stop meanings, and priority mapping are recorded in the linked design. Task 5 Steps 1--3 record that local contract; independent review, Linux artifact construction, and VM journal acceptance remain pending and must not be inferred from local tests.
+**Implementation status:** Complete. Reviewed code head `1e725d1283a05c8776415ce8422b8025f8a79cc5` implements the linked contract; its exact static linux/amd64 artifact (SHA-256 `3a2dcbd7ada7c9d07751be6609af3af9e42c81e5b4e0022d5c100a3599dbb76a`) passed live journal acceptance on Ubuntu 26.04 `minimal` with isolated synthetic networks and temporary hosts files. Qualification was recorded at documentation head `340aaf06a2901271709d366f99333c6a8c14b9fd`, where the final local gate passed with 89.9% coverage and docs-head artifact SHA-256 `628fadc3a765e169f14903577282b836533368f3d46b602729e7c9f825e80617`. No production source changed between those heads, but the docs-head artifact was not VM-run; the qualification does not cover a real Saltbox deployment, a `core` profile, a Saltbox template, or a release artifact.
 
 ## Global Constraints
 
@@ -515,13 +515,13 @@ git commit -m "feat(daemon): log event stream transitions"
 - Modify: `docs/superpowers/specs/2026-09-02-sdhm-operational-logging-design.md`
 - Modify: `docs/superpowers/plans/2026-09-02-sdhm-operational-logging.md`
 - Modify: `docs/superpowers/reviews/2026-09-02-sdhm-go-1.27-rewrite-review.md`
-- Retain evidence under: `.superpowers/sdd/2026-09-01-sdhm-go-1.27-rewrite/`
+- Retain evidence under: `.superpowers/sdd/2026-09-02-sdhm-operational-logging/`
 
 **Interfaces:**
 - Consumes: completed logging behavior and Saltbox VM lifecycle.
 - Produces: operator contract, exact committed-head local/VM evidence, and final review verdict.
 
-**Phase A status (2026-09-02):** Steps 1--3 are recorded by the documentation-contract commit. They establish the local operator contract only. Step 4 remains controller-owned; Steps 5--10 remain pending, including all live `PRIORITY` and Saltbox VM assertions.
+**Completion status (2026-09-02):** Steps 1--10 are complete. Independently reviewed code head `1e725d1283a05c8776415ce8422b8025f8a79cc5` supplied the exact VM-tested artifact (SHA-256 `3a2dcbd7ada7c9d07751be6609af3af9e42c81e5b4e0022d5c100a3599dbb76a`); documentation head `340aaf06a2901271709d366f99333c6a8c14b9fd` recorded the qualification and passed the final local gate with 89.9% coverage and docs-head artifact SHA-256 `628fadc3a765e169f14903577282b836533368f3d46b602729e7c9f825e80617`. No production source changed between the heads, but only the code-head artifact was VM-run, on Ubuntu 26.04 `minimal` with isolated synthetic networks and temporary hosts files. The result excludes a real Saltbox deployment, a `core` profile, a Saltbox template, and release qualification.
 
 - [x] **Step 1: Update operator and design documentation**
 
@@ -554,7 +554,7 @@ git add README.md docs/superpowers/specs/2026-09-01-sdhm-go-1.27-rewrite-design.
 git commit -m "docs(logging): define operational transitions"
 ```
 
-- [ ] **Step 4: Request independent code and spec review**
+- [x] **Step 4: Request independent code and spec review**
 
 Review from the pre-Task-1 base through the documentation commit along separate Standards and Spec axes. Require explicit closure of:
 
@@ -568,7 +568,7 @@ Review from the pre-Task-1 base through the documentation commit along separate 
 
 Fix every Critical or Important finding test-first and repeat review until both axes approve.
 
-- [ ] **Step 5: Build the exact acceptance artifact**
+- [x] **Step 5: Build the exact acceptance artifact**
 
 ```bash
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 make build
@@ -579,11 +579,11 @@ file build/sdhm
 
 Record the commit, SHA-256, static ELF result, and exact three-token version.
 
-- [ ] **Step 6: Inspect and prepare the VM lifecycle**
+- [x] **Step 6: Inspect and prepare the VM lifecycle**
 
 As root coordinator, read the installed Saltbox VM skill, call `inspect` with `target: system`, and stop on unhealthy checks or unexpected ownership. Prepare one Ubuntu 26.04 `minimal` ordinary slot and retain its exact `guest_instance_id` for every guest and finish call. Do not use core.
 
-- [ ] **Step 7: Run logging-specific VM acceptance**
+- [x] **Step 7: Run logging-specific VM acceptance**
 
 Install Docker on the minimal guest, transfer the exact binary, and use only temporary hosts/backup files and isolated synthetic networks. Run the candidate under transient systemd units and query journal entries with verbose fields.
 
@@ -600,11 +600,11 @@ Require all of the following:
 
 Install PID-specific idempotent `SIGCONT` cleanup before pausing dockerd. Retain the harness and raw journal evidence with hashes.
 
-- [ ] **Step 8: Clean and finish the VM**
+- [x] **Step 8: Clean and finish the VM**
 
 Remove transient units, containers, networks, temporary files, and payload. Verify Docker active and the assigned slot healthy on the same guest fence. Call `finish` with `passed`, require final state absent, then inspect the system and verify `test-a`, `test-b`, and `proxmox-runner` absent. On failure, finish with `failed` and preserve diagnostic state while needed.
 
-- [ ] **Step 9: Record and commit qualification evidence**
+- [x] **Step 9: Record and commit qualification evidence**
 
 Update the logging design status to `Implemented and qualified 2026-09-02`. Append the exact reviewed commit, binary SHA-256, journal priority/message assertions, helper operation IDs, evidence hashes, and final absent slot state to the written review and ignored SDD ledger.
 
@@ -613,7 +613,7 @@ git add docs/superpowers/specs/2026-09-02-sdhm-operational-logging-design.md doc
 git commit -m "test(logging): qualify journal transitions"
 ```
 
-- [ ] **Step 10: Run final committed-head verification**
+- [x] **Step 10: Run final committed-head verification**
 
 ```bash
 make check TEST_FLAGS='-count=1'

@@ -210,7 +210,7 @@ The `sdhm regenerate` command additionally records `regenerating hosts file` at 
 
 SDHM intentionally does **not** log individual Docker events, container names, unmonitored networks, successful periodic no-op reconciliations, ordinary successful hosts mutations, repeated reconnect failures with the same error, abandoned health-response writes, or intentionally unpublishable endpoint omissions. This keeps the journal a bounded transition history instead of an update-by-update event feed.
 
-Native-priority prefix mapping is covered by local tests. This documentation does not claim live systemd journal-priority acceptance; that VM qualification remains pending.
+Live systemd journal-priority acceptance passed on 2026-09-02 for reviewed code head `1e725d1283a05c8776415ce8422b8025f8a79cc5` and its static linux/amd64 artifact (SHA-256 `3a2dcbd7ada7c9d07751be6609af3af9e42c81e5b4e0022d5c100a3599dbb76a`) on an Ubuntu 26.04 `minimal` VM using isolated synthetic networks and temporary hosts files. This qualification does not cover a real Saltbox service deployment, a `core`-profile run, a release artifact, or the final documentation-head artifact (`340aaf06a2901271709d366f99333c6a8c14b9fd`; local build SHA-256 `628fadc3a765e169f14903577282b836533368f3d46b602729e7c9f825e80617`), which was not VM-run.
 
 
 ## How It Works
