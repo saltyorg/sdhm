@@ -704,54 +704,188 @@ func TestLoopLogsEventStreamClosedReason(t *testing.T) {
 	})
 }
 
-func TestLoopLogsEventStreamTerminationDoesNotReportLoss(t *testing.T) {
-	serveErr := errors.New("serve failure")
+func TestLoopStreamStopReady(t *testing.T) {
 	tests := []struct {
-		name    string
-		stop    func(*loopTestHarness)
-		wantErr error
+		name        string
+		cancelCtx   bool
+		closeServer bool
+		want        bool
 	}{
-		{name: "caller cancellation", stop: func(harness *loopTestHarness) { harness.cancel() }},
-		{name: "health server termination", stop: func(harness *loopTestHarness) { harness.server.finish(serveErr) }, wantErr: serveErr},
+		{name: "neither stop is ready", want: false},
+		{name: "caller cancellation is ready", cancelCtx: true, want: true},
+		{name: "health server termination is ready", closeServer: true, want: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			serverDone := make(chan struct{})
+			if tt.cancelCtx {
+				cancel()
+			}
+			if tt.closeServer {
+				close(serverDone)
+			}
+			if got := loopStreamStopReady(ctx, serverDone); got != tt.want {
+				t.Fatalf("loopStreamStopReady() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+type loopReadyStopCase struct {
+	name    string
+	stop    func(*loopTestHarness)
+	wantErr error
+}
+
+func loopReadyStopCases() []loopReadyStopCase {
+	serveErr := errors.New("serve failure")
+	return []loopReadyStopCase{
+		{name: "caller cancellation", stop: func(harness *loopTestHarness) { harness.cancel() }},
+		{name: "health server termination", stop: func(harness *loopTestHarness) { harness.server.finish(serveErr) }, wantErr: serveErr},
+	}
+}
+
+func reconnectLoopTestStream(t *testing.T, harness *loopTestHarness, message string) loopTestStream {
+	t.Helper()
+	next := newLoopTestStream()
+	harness.source.streams <- next
+	failLoopTestStream(harness.stream, errors.New(message))
+	receiveLoopValue(t, harness.source.streamCalls, "reconnected event stream")
+	synctest.Wait()
+	return next
+}
+
+func assertReadyStopResult(t *testing.T, harness *loopTestHarness, wantErr error) {
+	t.Helper()
+	err := harness.wait(t)
+	if wantErr == nil {
+		if err != nil {
+			t.Fatalf("Run() error = %v after caller cancellation, want nil", err)
+		}
+		return
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Run() error = %v, want wrapped %v", err, wantErr)
+	}
+}
+
+func assertNoLoopWorkScheduled(t *testing.T, harness *loopTestHarness) {
+	t.Helper()
+	if calls := harness.source.snapshotCount.Load(); calls != 1 {
+		t.Fatalf("Snapshot() calls = %d, want only initial reconciliation", calls)
+	}
+	select {
+	case call := <-harness.source.streamCalls:
+		t.Fatalf("unexpected event stream reconnect at %v", call.at)
+	default:
+	}
+}
+
+func assertEventStreamTransitionRecords(t *testing.T, recorder *logRecorder, wantWarnings, wantRecoveries int) {
+	t.Helper()
+	if warnings := logRecords(recorder.Records(), slog.LevelWarn, "Docker event stream unavailable"); len(warnings) != wantWarnings {
+		t.Fatalf("event stream warnings = %d, want %d", len(warnings), wantWarnings)
+	}
+	if recoveries := logRecords(recorder.Records(), slog.LevelInfo, "Docker event stream recovered"); len(recoveries) != wantRecoveries {
+		t.Fatalf("event stream recoveries = %d, want %d", len(recoveries), wantRecoveries)
+	}
+}
+
+func TestLoopSuppressesReadyStopStreamErrorTransition(t *testing.T) {
+	for _, tt := range loopReadyStopCases() {
+		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				source := newLoopTestSource()
-				reconnectStarted := make(chan struct{}, 1)
-				releaseReconnect := make(chan struct{})
-				source.onEvents = func(_ context.Context, call int) {
-					if call != 2 {
-						return
-					}
-					reconnectStarted <- struct{}{}
-					<-releaseReconnect
-				}
 				tracker := health.NewTracker()
-				harness := newLoopTestHarnessWith(t, loopTestConfig(), source, newLoopTestStore(), tracker, nil)
+				harness := newLoopTestHarnessWith(t, loopTestConfig(), newLoopTestSource(), newLoopTestStore(), tracker, nil)
 				harness.start(t)
 
-				failLoopTestStream(harness.stream, errors.New("stream failure before stop"))
-				receiveLoopValue(t, reconnectStarted, "blocked reconnect event stream")
 				tt.stop(harness)
-				synctest.Wait()
-				close(releaseReconnect)
-				err := harness.wait(t)
-				if tt.wantErr == nil {
-					if err != nil {
-						t.Fatalf("Run() error = %v after caller cancellation, want nil", err)
-					}
-				} else if !errors.Is(err, tt.wantErr) {
-					t.Fatalf("Run() error = %v, want wrapped %v", err, tt.wantErr)
-				}
+				harness.stream.errors <- errors.New("stream failure during stop")
+				assertReadyStopResult(t, harness, tt.wantErr)
 
-				if failures := logRecords(harness.recorder.Records(), slog.LevelWarn, "Docker event stream unavailable"); len(failures) != 1 {
-					t.Fatalf("event stream failures after %s = %d, want only the original failure", tt.name, len(failures))
+				assertActiveConcerns(t, tracker)
+				if history := tracker.Snapshot().History; len(history) != 0 {
+					t.Fatalf("event stream health history = %d, want 0", len(history))
 				}
+				assertEventStreamTransitionRecords(t, harness.recorder, 0, 0)
+				assertNoLoopWorkScheduled(t, harness)
+			})
+		})
+	}
+}
+
+func TestLoopSuppressesReadyStopEventTransition(t *testing.T) {
+	for _, tt := range loopReadyStopCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				tracker := health.NewTracker()
+				harness := newLoopTestHarnessWith(t, loopTestConfig(), newLoopTestSource(), newLoopTestStore(), tracker, nil)
+				harness.start(t)
+				stream := reconnectLoopTestStream(t, harness, "stream failure before stop")
+
+				tt.stop(harness)
+				stream.events <- Event{Action: "connect", Network: "saltbox"}
+				assertReadyStopResult(t, harness, tt.wantErr)
+
+				assertActiveConcerns(t, tracker, health.ConcernDockerEvents)
 				if history := tracker.Snapshot().History; len(history) != 1 {
-					t.Fatalf("event stream health history after %s = %d, want only the original failure", tt.name, len(history))
+					t.Fatalf("event stream health history = %d, want only the original failure", len(history))
 				}
+				assertEventStreamTransitionRecords(t, harness.recorder, 1, 0)
+				assertNoLoopWorkScheduled(t, harness)
+			})
+		})
+	}
+}
+
+func TestLoopSuppressesReadyStopStabilityTransition(t *testing.T) {
+	for _, tt := range loopReadyStopCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				tracker := health.NewTracker()
+				harness := newLoopTestHarnessWith(t, loopTestConfig(), newLoopTestSource(), newLoopTestStore(), tracker, nil)
+				harness.start(t)
+				reconnectLoopTestStream(t, harness, "stream failure before stop")
+				advanceLoopTime(t, 29*time.Second)
+
+				tt.stop(harness)
+				advanceLoopTime(t, time.Second)
+				assertReadyStopResult(t, harness, tt.wantErr)
+
+				assertActiveConcerns(t, tracker, health.ConcernDockerEvents)
+				if history := tracker.Snapshot().History; len(history) != 1 {
+					t.Fatalf("event stream health history = %d, want only the original failure", len(history))
+				}
+				assertEventStreamTransitionRecords(t, harness.recorder, 1, 0)
+				assertNoLoopWorkScheduled(t, harness)
+			})
+		})
+	}
+}
+
+func TestLoopSuppressesReadyStopReconnectTransition(t *testing.T) {
+	for _, tt := range loopReadyStopCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				tracker := health.NewTracker()
+				harness := newLoopTestHarnessWith(t, loopTestConfig(), newLoopTestSource(), newLoopTestStore(), tracker, nil)
+				harness.start(t)
+				failLoopTestStream(harness.stream, errors.New("stream failure before stop"))
+				synctest.Wait()
+
+				tt.stop(harness)
+				advanceLoopTime(t, retryInitialDelay)
+				assertReadyStopResult(t, harness, tt.wantErr)
+
+				assertActiveConcerns(t, tracker, health.ConcernDockerEvents)
+				if history := tracker.Snapshot().History; len(history) != 1 {
+					t.Fatalf("event stream health history = %d, want only the original failure", len(history))
+				}
+				assertEventStreamTransitionRecords(t, harness.recorder, 1, 0)
+				assertNoLoopWorkScheduled(t, harness)
 			})
 		})
 	}

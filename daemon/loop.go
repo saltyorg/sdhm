@@ -42,14 +42,29 @@ func (d *Daemon) loop(
 		streamCancel()
 		streamCancel = nil
 	}
+	streamStopReady := func() bool {
+		return loopStreamStopReady(ctx, d.server.Done())
+	}
 	startStream := func() {
+		if streamStopReady() {
+			return
+		}
 		cancelStream()
 		streamCtx, childCancel := context.WithCancel(ctx)
 		streamCancel = childCancel
 		events, eventErrors = d.source.Events(streamCtx, slices.Clone(d.config.Networks))
+		if streamStopReady() {
+			cancelStream()
+			events = nil
+			eventErrors = nil
+			return
+		}
 		stabilityTimer = resetLoopTimer(stabilityTimer, d.timing.streamStabilityDelay)
 	}
 	recoverStream := func(evidence string) {
+		if streamStopReady() {
+			return
+		}
 		reconnectDelay = d.timing.retryInitialDelay
 		stabilityTimer = stopLoopTimer(stabilityTimer)
 		d.tracker.Recover(health.ConcernDockerEvents)
@@ -63,7 +78,7 @@ func (d *Daemon) loop(
 		events = nil
 		eventErrors = nil
 		stabilityTimer = stopLoopTimer(stabilityTimer)
-		if ctx.Err() != nil {
+		if streamStopReady() {
 			return
 		}
 		message := eventStreamClosedMessage
@@ -90,6 +105,9 @@ func (d *Daemon) loop(
 		}
 	}
 	observeEvent := func() {
+		if streamStopReady() {
+			return
+		}
 		recoverStream("event")
 		if debounceTimer == nil {
 			maximumTimer = resetLoopTimer(maximumTimer, d.config.MaxDebounceDelay)
@@ -186,12 +204,18 @@ func (d *Daemon) loop(
 			pending = true
 		case <-loopTimerChannel(reconnectTimer):
 			reconnectTimer = stopLoopTimer(reconnectTimer)
+			if streamStopReady() {
+				continue
+			}
 			startStream()
 			if events == nil && eventErrors == nil {
 				disconnectStream(nil)
 			}
 		case <-loopTimerChannel(stabilityTimer):
 			stabilityTimer = stopLoopTimer(stabilityTimer)
+			if streamStopReady() {
+				continue
+			}
 			if streamErr, ready := streamErrorReady(); ready {
 				disconnectStream(streamErr)
 				continue
@@ -209,6 +233,21 @@ func (d *Daemon) loop(
 			}
 			recoverStream("stable")
 		}
+	}
+}
+
+func loopStreamStopReady(ctx context.Context, serverDone <-chan struct{}) bool {
+	select {
+	case <-serverDone:
+		return true
+	default:
+	}
+
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
 	}
 }
 
