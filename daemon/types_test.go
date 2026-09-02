@@ -19,8 +19,8 @@ func (*fakeNetworkSource) Events(context.Context, []string) (<-chan Event, <-cha
 }
 func (*fakeNetworkSource) Close() error { return nil }
 
-func (*fakeHostStore) Prepare(context.Context) error           { return nil }
-func (*fakeHostStore) Apply(context.Context, []Endpoint) error { return nil }
+func (*fakeHostStore) Prepare(context.Context) (PrepareResult, error) { return PrepareResult{}, nil }
+func (*fakeHostStore) Apply(context.Context, []Endpoint) error        { return nil }
 
 func (*fakeHealthServer) Start() error                   { return nil }
 func (*fakeHealthServer) Done() <-chan struct{}          { return make(chan struct{}) }

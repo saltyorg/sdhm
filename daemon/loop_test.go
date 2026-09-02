@@ -56,8 +56,8 @@ func newLoopTestStore() *loopTestStore {
 	return &loopTestStore{applyCalls: make(chan int, 64)}
 }
 
-func (*loopTestStore) Prepare(context.Context) error {
-	return nil
+func (*loopTestStore) Prepare(context.Context) (PrepareResult, error) {
+	return PrepareResult{}, nil
 }
 
 func (s *loopTestStore) Apply(ctx context.Context, _ []Endpoint) error {

@@ -55,38 +55,44 @@ var _ daemon.HostStore = (*Store)(nil)
 
 // Prepare validates the hosts file, creates an initial managed section when
 // none exists, and recovers corrupt markers only from a validated backup.
-func (s *Store) Prepare(ctx context.Context) error {
+func (s *Store) Prepare(ctx context.Context) (daemon.PrepareResult, error) {
 	if err := checkContext(ctx, "prepare hosts file"); err != nil {
-		return err
+		return daemon.PrepareResult{}, err
 	}
 
 	current, metadata, err := s.readRegularFile(s.hostsPath)
 	if err != nil {
-		return fmt.Errorf("read hosts file: %w", err)
+		return daemon.PrepareResult{}, fmt.Errorf("read hosts file: %w", err)
 	}
 	state, _, markerErr := locateMarkers(current, s.beginMarker, s.endMarker)
 	if markerErr == nil && state == validMarkers {
-		return s.ensureBackup(ctx, current, metadata)
+		if err := s.ensureBackup(ctx, current, metadata); err != nil {
+			return daemon.PrepareResult{}, err
+		}
+		return daemon.PrepareResult{}, nil
 	}
 	if markerErr == nil && state == noMarkers {
 		proposed := appendEmptySection(current, s.beginMarker, s.endMarker)
 		if err := requireValidMarkers(proposed, s.beginMarker, s.endMarker); err != nil {
-			return fmt.Errorf("validate initialized hosts file: %w", err)
+			return daemon.PrepareResult{}, fmt.Errorf("validate initialized hosts file: %w", err)
 		}
-		return s.initializeManagedSection(ctx, current, proposed, metadata)
+		if err := s.initializeManagedSection(ctx, current, proposed, metadata); err != nil {
+			return daemon.PrepareResult{}, err
+		}
+		return daemon.PrepareResult{}, nil
 	}
 
 	backup, _, err := s.readRegularFile(s.backupPath)
 	if err != nil {
-		return fmt.Errorf("recover corrupt hosts file: %w", errors.Join(markerErr, err))
+		return daemon.PrepareResult{}, fmt.Errorf("recover corrupt hosts file: %w", errors.Join(markerErr, err))
 	}
 	if err := requireValidMarkers(backup, s.beginMarker, s.endMarker); err != nil {
-		return fmt.Errorf("recover corrupt hosts file: invalid backup: %w", errors.Join(markerErr, err))
+		return daemon.PrepareResult{}, fmt.Errorf("recover corrupt hosts file: invalid backup: %w", errors.Join(markerErr, err))
 	}
 	if err := s.restoreTarget(ctx, s.hostsPath, backup, metadata); err != nil {
-		return fmt.Errorf("recover corrupt hosts file: %w", err)
+		return daemon.PrepareResult{}, fmt.Errorf("recover corrupt hosts file: %w", err)
 	}
-	return nil
+	return daemon.PrepareResult{RecoveredFromBackup: true}, nil
 }
 
 // Apply replaces the managed body from one complete endpoint snapshot.
@@ -201,7 +207,13 @@ func (s *Store) applyReplacement(ctx context.Context, current, proposed []byte, 
 		return primaryErr
 	}
 	rollbackErr := s.rollbackTarget(ctx, s.hostsPath, current, targetMetadata)
-	return errors.Join(primaryErr, rollbackErr)
+	if rollbackErr == nil {
+		return fmt.Errorf("%w; target restored from retained snapshot", primaryErr)
+	}
+	return errors.Join(
+		primaryErr,
+		fmt.Errorf("restore target after replacement failure: %w", rollbackErr),
+	)
 }
 
 func (s *Store) ensureBackup(ctx context.Context, validTarget []byte, targetMetadata fileMetadata) error {

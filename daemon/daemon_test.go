@@ -111,10 +111,11 @@ func (s *orderedSource) calls() ([]context.Context, []context.Context, [][]strin
 type orderedStore struct {
 	log *operationLog
 
-	prepareErr error
-	applyErr   error
-	onPrepare  func(context.Context)
-	onApply    func(context.Context)
+	prepareResult PrepareResult
+	prepareErr    error
+	applyErr      error
+	onPrepare     func(context.Context)
+	onApply       func(context.Context)
 
 	mu             sync.Mutex
 	applyContexts  []context.Context
@@ -122,12 +123,12 @@ type orderedStore struct {
 	current        []Endpoint
 }
 
-func (s *orderedStore) Prepare(ctx context.Context) error {
+func (s *orderedStore) Prepare(ctx context.Context) (PrepareResult, error) {
 	s.log.add("hosts_prepare")
 	if s.onPrepare != nil {
 		s.onPrepare(ctx)
 	}
-	return s.prepareErr
+	return s.prepareResult, s.prepareErr
 }
 
 func (s *orderedStore) Apply(ctx context.Context, endpoints []Endpoint) error {
@@ -801,6 +802,69 @@ func TestRunSuccessfulPreparationClearsRecoveryConcern(t *testing.T) {
 	}
 	assertOperations(t, log, []string{"ping", "health_start", "hosts_prepare", "health_shutdown", "source_close"})
 	assertActiveConcerns(t, tracker)
+}
+
+func TestRunLogsValidatedBackupRecovery(t *testing.T) {
+	tests := []struct {
+		name          string
+		prepareResult PrepareResult
+		wantWarning   bool
+	}{
+		{
+			name:          "validated backup recovery",
+			prepareResult: PrepareResult{RecoveredFromBackup: true},
+			wantWarning:   true,
+		},
+		{name: "normal preparation"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			log := &operationLog{}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			snapshotStarted := make(chan struct{})
+			source := &orderedSource{
+				log: log,
+				onSnapshot: func(context.Context) {
+					close(snapshotStarted)
+					cancel()
+				},
+			}
+			store := &orderedStore{log: log, prepareResult: tt.prepareResult}
+			recorder := newLogRecorder()
+			daemon, err := New(
+				validConfig(),
+				source,
+				store,
+				health.NewTracker(),
+				newOrderedHealthServer(log),
+				slog.New(recorder),
+			)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+
+			if err := daemon.Run(ctx); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			<-snapshotStarted
+
+			gotWarnings := 0
+			for _, record := range recorder.Records() {
+				if record.Level == slog.LevelWarn && record.Message == "hosts file recovered from validated backup" {
+					gotWarnings++
+				}
+			}
+			wantWarnings := 0
+			if tt.wantWarning {
+				wantWarnings = 1
+			}
+			if gotWarnings != wantWarnings {
+				t.Fatalf("recovery warning count = %d, want %d", gotWarnings, wantWarnings)
+			}
+		})
+	}
 }
 
 func TestRunCallerCancellationBeforeAndDuringStartupIsClean(t *testing.T) {

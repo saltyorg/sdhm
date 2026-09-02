@@ -36,9 +36,14 @@ type NetworkSource interface {
 	Close() error
 }
 
+// PrepareResult describes an observed outcome while preparing the hosts file.
+type PrepareResult struct {
+	RecoveredFromBackup bool
+}
+
 // HostStore prepares and updates the managed hosts file.
 type HostStore interface {
-	Prepare(context.Context) error
+	Prepare(context.Context) (PrepareResult, error)
 	Apply(context.Context, []Endpoint) error
 }
 

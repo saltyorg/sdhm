@@ -436,8 +436,12 @@ func TestStorePrepareUsesOpenedFileAcrossSymlinkPathSwap(t *testing.T) {
 	store := NewStore(hostsPath, backupPath, section, "saltbox")
 	store.ops = ops
 
-	if err := store.Prepare(t.Context()); err != nil {
+	result, err := store.Prepare(t.Context())
+	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
+	}
+	if result != (daemon.PrepareResult{}) {
+		t.Fatalf("Prepare() result = %+v, want zero result", result)
 	}
 	if !swapped {
 		t.Fatal("path swap did not run")
@@ -863,8 +867,12 @@ func TestStorePrepareStates(t *testing.T) {
 		target, backup := createStoreFiles(t, []byte(validA), []byte(validB))
 		store := NewStore(target, backup, section, "saltbox")
 
-		if err := store.Prepare(t.Context()); err != nil {
+		result, err := store.Prepare(t.Context())
+		if err != nil {
 			t.Fatalf("Prepare() error = %v", err)
+		}
+		if result != (daemon.PrepareResult{}) {
+			t.Fatalf("Prepare() result = %+v, want zero result", result)
 		}
 		assertFileContent(t, target, []byte(validA))
 		assertFileContent(t, backup, []byte(validB))
@@ -874,8 +882,12 @@ func TestStorePrepareStates(t *testing.T) {
 		target, backup := createStoreFiles(t, []byte(validA), nil)
 		store := NewStore(target, backup, section, "saltbox")
 
-		if err := store.Prepare(t.Context()); err != nil {
+		result, err := store.Prepare(t.Context())
+		if err != nil {
 			t.Fatalf("Prepare() error = %v", err)
+		}
+		if result != (daemon.PrepareResult{}) {
+			t.Fatalf("Prepare() result = %+v, want zero result", result)
 		}
 		assertFileContent(t, target, []byte(validA))
 		assertFileContent(t, backup, []byte(validA))
@@ -888,8 +900,12 @@ func TestStorePrepareStates(t *testing.T) {
 		}
 		store := NewStore(target, backup, section, "saltbox")
 
-		if err := store.Prepare(t.Context()); err != nil {
+		result, err := store.Prepare(t.Context())
+		if err != nil {
 			t.Fatalf("Prepare() error = %v", err)
+		}
+		if result != (daemon.PrepareResult{}) {
+			t.Fatalf("Prepare() result = %+v, want zero result", result)
 		}
 		assertFileContent(t, target, []byte(validA))
 		assertFileContent(t, backup, []byte(validA))
@@ -905,8 +921,12 @@ func TestStorePrepareStates(t *testing.T) {
 		}
 		store := NewStore(target, backup, section, "saltbox")
 
-		if err := store.Prepare(t.Context()); err != nil {
+		result, err := store.Prepare(t.Context())
+		if err != nil {
 			t.Fatalf("Prepare() error = %v", err)
+		}
+		if result != (daemon.PrepareResult{}) {
+			t.Fatalf("Prepare() result = %+v, want zero result", result)
 		}
 		assertFileContent(t, target, want)
 		assertFileContent(t, backup, want)
@@ -923,8 +943,12 @@ func TestStorePrepareStates(t *testing.T) {
 		}
 		store := NewStore(target, backup, section, "saltbox")
 
-		if err := store.Prepare(t.Context()); err != nil {
+		result, err := store.Prepare(t.Context())
+		if err != nil {
 			t.Fatalf("Prepare() error = %v", err)
+		}
+		if !result.RecoveredFromBackup {
+			t.Fatal("Prepare() did not report validated backup recovery")
 		}
 		assertFileContent(t, target, []byte(validB))
 		assertFileMode(t, target, 0o600)
@@ -936,8 +960,12 @@ func TestStorePrepareStates(t *testing.T) {
 		target, backup := createStoreFiles(t, []byte(corrupt), []byte("127.0.0.1 backup-without-markers\n"))
 		store := NewStore(target, backup, section, "saltbox")
 
-		if err := store.Prepare(t.Context()); err == nil {
+		result, err := store.Prepare(t.Context())
+		if err == nil {
 			t.Fatal("Prepare() error = nil, want invalid recovery error")
+		}
+		if result != (daemon.PrepareResult{}) {
+			t.Fatalf("Prepare() result = %+v, want zero result", result)
 		}
 		assertFileContent(t, target, []byte(corrupt))
 		assertFileContent(t, backup, []byte("127.0.0.1 backup-without-markers\n"))
@@ -953,8 +981,12 @@ func TestStorePrepareRejectsMissingAndNonRegularTargets(t *testing.T) {
 		backup := filepath.Join(dir, "hosts.backup")
 		store := NewStore(target, backup, section, "saltbox")
 
-		if err := store.Prepare(t.Context()); err == nil {
+		result, err := store.Prepare(t.Context())
+		if err == nil {
 			t.Fatal("Prepare() error = nil, want missing-target error")
+		}
+		if result != (daemon.PrepareResult{}) {
+			t.Fatalf("Prepare() result = %+v, want zero result", result)
 		}
 		if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("target was created or cannot be checked: %v", err)
@@ -974,8 +1006,12 @@ func TestStorePrepareRejectsMissingAndNonRegularTargets(t *testing.T) {
 		}
 		store := NewStore(target, filepath.Join(dir, "hosts.backup"), section, "saltbox")
 
-		if err := store.Prepare(t.Context()); err == nil {
+		result, err := store.Prepare(t.Context())
+		if err == nil {
 			t.Fatal("Prepare() error = nil, want symlink-target error")
+		}
+		if result != (daemon.PrepareResult{}) {
+			t.Fatalf("Prepare() result = %+v, want zero result", result)
 		}
 		assertFileContent(t, referenced, original)
 		info, err := os.Lstat(target)
@@ -999,8 +1035,12 @@ func TestStorePrepareRejectsMissingAndNonRegularTargets(t *testing.T) {
 		}
 		store := NewStore(target, filepath.Join(dir, "hosts.backup"), section, "saltbox")
 
-		if err := store.Prepare(t.Context()); err == nil {
+		result, err := store.Prepare(t.Context())
+		if err == nil {
 			t.Fatal("Prepare() error = nil, want directory-target error")
+		}
+		if result != (daemon.PrepareResult{}) {
+			t.Fatalf("Prepare() result = %+v, want zero result", result)
 		}
 		assertFileContent(t, sentinel, []byte("unchanged\n"))
 	})
@@ -1140,7 +1180,7 @@ func TestStoreApplyLateTargetFailureRollsBackOnlyTarget(t *testing.T) {
 	old := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n10.0.0.1 old old.saltbox\n# END DOCKER CONTAINERS\n")
 	target, backup := createStoreFiles(t, old, []byte("backup sentinel\n"))
 	ops := newFaultOps()
-	ops.failAt["dir_sync"] = 2
+	ops.failAt["readback_open"] = 2
 	store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
 	store.ops = ops
 	endpoints := []daemon.Endpoint{{
@@ -1150,8 +1190,11 @@ func TestStoreApplyLateTargetFailureRollsBackOnlyTarget(t *testing.T) {
 	}}
 
 	err := store.Apply(t.Context(), endpoints)
-	if !errors.Is(err, ops.failErr["dir_sync"]) {
-		t.Fatalf("Apply() error = %v, want target dir-sync sentinel", err)
+	if !errors.Is(err, ops.failErr["readback_open"]) {
+		t.Fatalf("Apply() error = %v, want target readback sentinel", err)
+	}
+	if !strings.Contains(err.Error(), "target restored from retained snapshot") {
+		t.Fatalf("Apply() error = %q, want successful rollback outcome", err)
 	}
 	assertFileContent(t, target, old)
 	assertFileContent(t, backup, old)
@@ -1214,6 +1257,9 @@ func TestStoreApplyJoinsPrimaryAndRollbackFailures(t *testing.T) {
 	}
 	if !errors.Is(err, rollbackSentinel) {
 		t.Errorf("Apply() error = %v, want rollback sentinel", err)
+	}
+	if !strings.Contains(err.Error(), "restore target after replacement failure") {
+		t.Errorf("Apply() error = %q, want failed rollback outcome", err)
 	}
 	assertFileContent(t, backup, old)
 	wantTarget := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.2 radarr radarr.saltbox\n# END DOCKER CONTAINERS\n")

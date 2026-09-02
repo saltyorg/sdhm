@@ -120,13 +120,17 @@ func (d *Daemon) Run(parent context.Context) error {
 		return finish(runErr, captured)
 	}
 
-	if err := d.store.Prepare(ctx); err != nil {
+	prepareResult, err := d.store.Prepare(ctx)
+	if err != nil {
 		var runErr error
 		if parent.Err() == nil && (ctx.Err() == nil || !errors.Is(err, ctx.Err())) {
 			d.tracker.Fail(health.ConcernRecovery, err.Error())
 			runErr = fmt.Errorf("prepare hosts store: %w", err)
 		}
 		return finish(runErr, false)
+	}
+	if prepareResult.RecoveredFromBackup {
+		d.logger.Warn("hosts file recovered from validated backup")
 	}
 	d.tracker.Recover(health.ConcernRecovery)
 	if runErr, captured, stop := d.startupStop(parent); stop {

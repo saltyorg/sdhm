@@ -288,7 +288,9 @@ func (s *wiringNetworkSource) Close() error {
 
 type wiringHostStore struct{}
 
-func (*wiringHostStore) Prepare(context.Context) error { return nil }
+func (*wiringHostStore) Prepare(context.Context) (daemon.PrepareResult, error) {
+	return daemon.PrepareResult{}, nil
+}
 
 func (*wiringHostStore) Apply(context.Context, []daemon.Endpoint) error { return nil }
 
