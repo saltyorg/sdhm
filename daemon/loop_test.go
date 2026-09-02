@@ -552,6 +552,211 @@ func TestLoopLogsCancellationDuringReconciliation(t *testing.T) {
 	})
 }
 
+func TestLoopLogsEventStreamFailureTransitions(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		source := newLoopTestSource()
+		firstFailure := errors.New("event stream unavailable")
+		sameFailure := errors.New("event stream unavailable")
+		changedFailure := errors.New("event stream denied")
+		harness := newLoopTestHarnessWith(t, loopTestConfig(), source, newLoopTestStore(), health.NewTracker(), nil)
+		defer harness.stop(t)
+		harness.start(t)
+
+		if recovered := logRecords(harness.recorder.Records(), slog.LevelInfo, "Docker event stream recovered"); len(recovered) != 0 {
+			t.Fatalf("event stream recoveries before a failure = %d, want 0", len(recovered))
+		}
+
+		secondStream := newLoopTestStream()
+		source.streams <- secondStream
+		failLoopTestStream(harness.stream, firstFailure)
+		receiveLoopValue(t, source.streamCalls, "first reconnected event stream")
+		synctest.Wait()
+
+		failures := logRecords(harness.recorder.Records(), slog.LevelWarn, "Docker event stream unavailable")
+		if len(failures) != 1 {
+			t.Fatalf("event stream failures = %d, want 1", len(failures))
+		}
+		if got := logAttr(t, failures[0], "err"); got.Kind() != slog.KindString || got.String() != firstFailure.Error() {
+			t.Errorf("first stream err = %v, want %q", got, firstFailure)
+		}
+		if got := logAttr(t, failures[0], "retry_in"); got.Kind() != slog.KindDuration || got.Duration() != retryInitialDelay {
+			t.Errorf("first stream retry_in = %v, want %v", got, retryInitialDelay)
+		}
+
+		thirdStream := newLoopTestStream()
+		source.streams <- thirdStream
+		failLoopTestStream(secondStream, sameFailure)
+		receiveLoopValue(t, source.streamCalls, "second reconnected event stream")
+		synctest.Wait()
+		if failures := logRecords(harness.recorder.Records(), slog.LevelWarn, "Docker event stream unavailable"); len(failures) != 1 {
+			t.Fatalf("event stream failures after identical reconnect failure = %d, want 1", len(failures))
+		}
+
+		fourthStream := newLoopTestStream()
+		source.streams <- fourthStream
+		failLoopTestStream(thirdStream, changedFailure)
+		receiveLoopValue(t, source.streamCalls, "third reconnected event stream")
+		synctest.Wait()
+
+		failures = logRecords(harness.recorder.Records(), slog.LevelWarn, "Docker event stream unavailable")
+		if len(failures) != 2 {
+			t.Fatalf("event stream failures after changed reconnect failure = %d, want 2", len(failures))
+		}
+		if got := logAttr(t, failures[1], "err"); got.Kind() != slog.KindString || got.String() != changedFailure.Error() {
+			t.Errorf("changed stream err = %v, want %q", got, changedFailure)
+		}
+		if got := logAttr(t, failures[1], "retry_in"); got.Kind() != slog.KindDuration || got.Duration() != 4*time.Second {
+			t.Errorf("changed stream retry_in = %v, want %v", got, 4*time.Second)
+		}
+	})
+}
+
+func TestLoopLogsEventStreamRecoveryFromEventOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		source := newLoopTestSource()
+		harness := newLoopTestHarnessWith(t, loopTestConfig(), source, newLoopTestStore(), health.NewTracker(), nil)
+		defer harness.stop(t)
+		harness.start(t)
+
+		secondStream := newLoopTestStream()
+		source.streams <- secondStream
+		failLoopTestStream(harness.stream, errors.New("event stream unavailable"))
+		receiveLoopValue(t, source.streamCalls, "reconnected event stream")
+
+		secondStream.events <- Event{Action: "connect", Network: "saltbox"}
+		synctest.Wait()
+		recovered := logRecords(harness.recorder.Records(), slog.LevelInfo, "Docker event stream recovered")
+		if len(recovered) != 1 {
+			t.Fatalf("event stream recoveries after an event = %d, want 1", len(recovered))
+		}
+		if got := logAttr(t, recovered[0], "evidence"); got.Kind() != slog.KindString || got.String() != "event" {
+			t.Errorf("event stream recovery evidence = %v, want event", got)
+		}
+
+		secondStream.events <- Event{Action: "disconnect", Network: "backend"}
+		advanceLoopTime(t, streamStabilityDelay)
+		synctest.Wait()
+		if recovered := logRecords(harness.recorder.Records(), slog.LevelInfo, "Docker event stream recovered"); len(recovered) != 1 {
+			t.Fatalf("event stream recoveries after later event and stable time = %d, want 1", len(recovered))
+		}
+	})
+}
+
+func TestLoopLogsEventStreamRecoveryAfterStableConnectionOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		source := newLoopTestSource()
+		harness := newLoopTestHarnessWith(t, loopTestConfig(), source, newLoopTestStore(), health.NewTracker(), nil)
+		defer harness.stop(t)
+		harness.start(t)
+
+		secondStream := newLoopTestStream()
+		source.streams <- secondStream
+		failLoopTestStream(harness.stream, errors.New("event stream unavailable"))
+		receiveLoopValue(t, source.streamCalls, "reconnected event stream")
+
+		advanceLoopTime(t, 29*time.Second)
+		synctest.Wait()
+		if recovered := logRecords(harness.recorder.Records(), slog.LevelInfo, "Docker event stream recovered"); len(recovered) != 0 {
+			t.Fatalf("event stream recoveries before thirty stable seconds = %d, want 0", len(recovered))
+		}
+
+		advanceLoopTime(t, time.Second)
+		synctest.Wait()
+		recovered := logRecords(harness.recorder.Records(), slog.LevelInfo, "Docker event stream recovered")
+		if len(recovered) != 1 {
+			t.Fatalf("event stream recoveries after stable connection = %d, want 1", len(recovered))
+		}
+		if got := logAttr(t, recovered[0], "evidence"); got.Kind() != slog.KindString || got.String() != "stable" {
+			t.Errorf("stable stream recovery evidence = %v, want stable", got)
+		}
+
+		secondStream.events <- Event{Action: "connect", Network: "saltbox"}
+		advanceLoopTime(t, 30*time.Second)
+		synctest.Wait()
+		if recovered := logRecords(harness.recorder.Records(), slog.LevelInfo, "Docker event stream recovered"); len(recovered) != 1 {
+			t.Fatalf("event stream recoveries after later event and stable time = %d, want 1", len(recovered))
+		}
+	})
+}
+
+func TestLoopLogsEventStreamClosedReason(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		source := newLoopTestSource()
+		harness := newLoopTestHarnessWith(t, loopTestConfig(), source, newLoopTestStore(), health.NewTracker(), nil)
+		defer harness.stop(t)
+		harness.start(t)
+
+		source.streams <- newLoopTestStream()
+		close(harness.stream.errors)
+		receiveLoopValue(t, source.streamCalls, "reconnected event stream after closure")
+		synctest.Wait()
+
+		failures := logRecords(harness.recorder.Records(), slog.LevelWarn, "Docker event stream unavailable")
+		if len(failures) != 1 {
+			t.Fatalf("event stream failures after closure = %d, want 1", len(failures))
+		}
+		if got := logAttr(t, failures[0], "err"); got.Kind() != slog.KindString || got.String() != eventStreamClosedMessage {
+			t.Errorf("closed stream err = %v, want %q", got, eventStreamClosedMessage)
+		}
+		if got := logAttr(t, failures[0], "retry_in"); got.Kind() != slog.KindDuration || got.Duration() != retryInitialDelay {
+			t.Errorf("closed stream retry_in = %v, want %v", got, retryInitialDelay)
+		}
+	})
+}
+
+func TestLoopLogsEventStreamTerminationDoesNotReportLoss(t *testing.T) {
+	serveErr := errors.New("serve failure")
+	tests := []struct {
+		name    string
+		stop    func(*loopTestHarness)
+		wantErr error
+	}{
+		{name: "caller cancellation", stop: func(harness *loopTestHarness) { harness.cancel() }},
+		{name: "health server termination", stop: func(harness *loopTestHarness) { harness.server.finish(serveErr) }, wantErr: serveErr},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				source := newLoopTestSource()
+				reconnectStarted := make(chan struct{}, 1)
+				releaseReconnect := make(chan struct{})
+				source.onEvents = func(_ context.Context, call int) {
+					if call != 2 {
+						return
+					}
+					reconnectStarted <- struct{}{}
+					<-releaseReconnect
+				}
+				tracker := health.NewTracker()
+				harness := newLoopTestHarnessWith(t, loopTestConfig(), source, newLoopTestStore(), tracker, nil)
+				harness.start(t)
+
+				failLoopTestStream(harness.stream, errors.New("stream failure before stop"))
+				receiveLoopValue(t, reconnectStarted, "blocked reconnect event stream")
+				tt.stop(harness)
+				synctest.Wait()
+				close(releaseReconnect)
+				err := harness.wait(t)
+				if tt.wantErr == nil {
+					if err != nil {
+						t.Fatalf("Run() error = %v after caller cancellation, want nil", err)
+					}
+				} else if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("Run() error = %v, want wrapped %v", err, tt.wantErr)
+				}
+
+				if failures := logRecords(harness.recorder.Records(), slog.LevelWarn, "Docker event stream unavailable"); len(failures) != 1 {
+					t.Fatalf("event stream failures after %s = %d, want only the original failure", tt.name, len(failures))
+				}
+				if history := tracker.Snapshot().History; len(history) != 1 {
+					t.Fatalf("event stream health history after %s = %d, want only the original failure", tt.name, len(history))
+				}
+			})
+		})
+	}
+}
+
 func TestLoopRetryBackoffStopsAtMaximum(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := loopTestConfig()

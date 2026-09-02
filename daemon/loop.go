@@ -25,6 +25,7 @@ func (d *Daemon) loop(
 	reconnectDelay := d.timing.retryInitialDelay
 	pending := false
 	lastReconcileFailure := ""
+	lastStreamFailure := ""
 	if initialReconcileErr != nil {
 		lastReconcileFailure = initialReconcileErr.Error()
 		retryTimer = resetLoopTimer(retryTimer, retryDelay)
@@ -48,14 +49,30 @@ func (d *Daemon) loop(
 		events, eventErrors = d.source.Events(streamCtx, slices.Clone(d.config.Networks))
 		stabilityTimer = resetLoopTimer(stabilityTimer, d.timing.streamStabilityDelay)
 	}
+	recoverStream := func(evidence string) {
+		reconnectDelay = d.timing.retryInitialDelay
+		stabilityTimer = stopLoopTimer(stabilityTimer)
+		d.tracker.Recover(health.ConcernDockerEvents)
+		if lastStreamFailure != "" {
+			d.logger.Info("Docker event stream recovered", "evidence", evidence)
+			lastStreamFailure = ""
+		}
+	}
 	disconnectStream := func(err error) {
 		cancelStream()
 		events = nil
 		eventErrors = nil
 		stabilityTimer = stopLoopTimer(stabilityTimer)
+		if ctx.Err() != nil {
+			return
+		}
 		message := eventStreamClosedMessage
 		if err != nil {
 			message = err.Error()
+		}
+		if message != lastStreamFailure {
+			d.logger.Warn("Docker event stream unavailable", "err", message, "retry_in", reconnectDelay)
+			lastStreamFailure = message
 		}
 		d.tracker.Fail(health.ConcernDockerEvents, message)
 		reconnectTimer = resetLoopTimer(reconnectTimer, reconnectDelay)
@@ -73,9 +90,7 @@ func (d *Daemon) loop(
 		}
 	}
 	observeEvent := func() {
-		reconnectDelay = d.timing.retryInitialDelay
-		stabilityTimer = stopLoopTimer(stabilityTimer)
-		d.tracker.Recover(health.ConcernDockerEvents)
+		recoverStream("event")
 		if debounceTimer == nil {
 			maximumTimer = resetLoopTimer(maximumTimer, d.config.MaxDebounceDelay)
 		}
@@ -192,8 +207,7 @@ func (d *Daemon) loop(
 				continue
 			default:
 			}
-			reconnectDelay = d.timing.retryInitialDelay
-			d.tracker.Recover(health.ConcernDockerEvents)
+			recoverStream("stable")
 		}
 	}
 }
