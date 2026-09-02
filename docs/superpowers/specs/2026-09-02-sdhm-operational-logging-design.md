@@ -1,24 +1,19 @@
 # SDHM Operational Logging Design
 
 Date: 2026-09-02
-Status: Proposed for review
+Status: Implemented; acceptance pending
 
 ## Purpose
 
 Make every actionable SDHM failure, recovery, and lifecycle transition visible in `journalctl` without restoring v1.0.4's per-event and per-update noise. Health remains the authoritative current-state API; logs become a durable transition history that explains when health changed and when an automatic safety action occurred.
 
-## Current Findings
+## Implementation Status
 
-- Saltbox's unit captures stdout and stderr in journald. Terminal construction, configuration, Docker Ping, listener, preparation, health-server, shutdown, and Docker-close failures already reach one process-boundary stderr line.
-- Snapshot and hosts-Apply failures reach both health and a `WARN` log.
-- Docker event-stream loss and recovery are health-only.
-- Successful reconciliation after a failure is health-only, so a warning has no journal closure record.
-- Successful recovery of corrupt markers from a validated backup is silent and creates no health history.
-- Successful target rollback after a late replacement failure is implicit in the returned primary error.
-- The only application lifecycle record is emitted before Docker construction and initial reconciliation.
-- Plain `slog` text written to the journal stream arrives with native journal priority `6`; `level=WARN` exists only inside `MESSAGE`.
+The implementation through `2eeef4cdd234da4c9bc3258b124f5496ba2711bc` supplies the process, daemon, and storage transitions defined below. Local tests cover record levels, messages, fields, suppression, rollback wording, cancellation behavior, and process priority-prefix formatting.
 
-The live v1.0.4 journal also demonstrates what must not return: unmonitored bridge events, container-name lookup solely for logging, every monitored event, and every successful hosts update created high-volume noise.
+Native priority behavior has not yet been qualified in a live systemd journal, and no Saltbox VM evidence is claimed here. The pending acceptance procedure remains in this document and in the implementation plan.
+
+The live v1.0.4 journal established the noise that must not return: unmonitored bridge events, container-name lookup solely for logging, every monitored event, and every successful hosts update.
 
 ## Logging Contract
 
@@ -26,16 +21,17 @@ Logs describe transitions, not every attempt or event.
 
 | Transition | Level | Message | Required fields | Suppression |
 |---|---|---|---|---|
-| Process invocation | INFO | `starting SDHM` | `version`, `networks`, `default_network`, `interval`, `health_addr` | Once per process |
+| Process invocation | INFO | `starting SDHM` | `version`, `networks`, `default_network`, `interval`, `health_addr` (address and port) | Once per process |
 | Initial reconciliation succeeds | INFO | `SDHM ready` | None | Once per process |
-| Initial or later reconciliation fails | WARN | `reconciliation failed` | `err`, `retry_in` when retrying | First failure and when exact error changes |
+| Initial reconciliation fails | WARN | `reconciliation failed` | `phase=initial`, `err`, `retry_in` | Once after the first failed reconciliation |
+| Later reconciliation fails | WARN | `reconciliation failed` | `err`, `retry_in` | First failure and when exact error changes |
 | Reconciliation succeeds after failure | INFO | `reconciliation recovered` | None | Once per failed-to-healthy transition |
 | Event stream becomes unavailable | WARN | `Docker event stream unavailable` | `err`, `retry_in` | First failure and when exact error changes |
 | Event stream becomes healthy | INFO | `Docker event stream recovered` | `evidence=event` or `evidence=stable` | Once per failed-to-healthy transition |
 | Corrupt target restored from backup | WARN | `hosts file recovered from validated backup` | None | Once during preparation |
 | Late target replacement rolls back successfully | WARN via reconciliation error | Existing replacement error plus explicit `target restored from retained snapshot` | Included in `err` | Once per distinct reconciliation failure |
-| Clean `Run` completion | INFO | `SDHM stopped` | None | Once per process |
-| Terminal process error | ERROR/native priority 3 | Existing concise error text | None | Once at process boundary |
+| Clean `Run` completion | INFO | `SDHM stopped` | None | Once per clean process completion; omitted after a terminal daemon error |
+| Terminal process error | ERROR/native priority 3 | One concise command error string | None | Once at process boundary; invalid configuration has no usage dump |
 
 The following remain silent:
 
@@ -46,7 +42,9 @@ The following remain silent:
 - health-response writes abandoned by the client;
 - endpoint omission for intentionally unpublishable containers.
 
-Clean shutdown already has systemd stop/deactivation records, but one final application record confirms that SDHM joined its listener, event mapper, and Docker client successfully.
+`SDHM ready` means the health listener was started, hosts preparation completed, and the first reconciliation succeeded. `SDHM stopped` means `Run` returned cleanly after its shutdown cleanup; it is not a record for a failing daemon run. Health is therefore current state, while the journal preserves transition history even after health has recovered.
+
+`sdhm regenerate` records `regenerating hosts file` at INFO with `path`; either command warns `SDHM should run as root to modify the hosts file` when its effective UID is not root. These command records do not alter the daemon transition policy.
 
 ## State Ownership
 
@@ -84,7 +82,7 @@ No public CLI option or dynamic log-level configuration is added.
 
 The handler delegates formatting, attributes, groups, and minimum-level behavior to standard `slog.TextHandler` instances. A shared writer mutex keeps the prefix and complete record atomic across levels. `WithAttrs` and `WithGroup` return cloned wrappers around the corresponding delegated handlers.
 
-The process-boundary terminal error writer uses `<3>` only when `JOURNAL_STREAM` is present. Interactive execution keeps the current unprefixed output. This requires no third-party dependency and no Saltbox template change; historical systemd units retain the default prefix parser.
+The process-boundary terminal error writer uses `<3>` only when `JOURNAL_STREAM` is present. Interactive execution keeps the current unprefixed output. This requires no third-party dependency and no Saltbox template change; historical systemd units retain the default prefix parser. This behavior is locally tested; the live parser configuration and resulting `PRIORITY` values remain acceptance-pending.
 
 Implementation must follow the official Go `slog.Handler` contract and its concurrency rules: <https://pkg.go.dev/golang.org/x/example/slog-handler-guide>. Systemd stream behavior is defined by `SyslogLevel=` and `SyslogLevelPrefix=` in the official execution manual: <https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html>.
 

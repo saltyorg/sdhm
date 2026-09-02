@@ -174,6 +174,44 @@ sudo systemctl status sdhm
 sudo journalctl -u sdhm -f
 ```
 
+### Operational Logs
+
+Health answers the current question: whether SDHM is ready and whether an active concern makes it unhealthy. The journal answers the historical question: when the daemon crossed a lifecycle, failure, recovery, or automatic-repair boundary. A healthy response does not erase the corresponding warning from the journal.
+
+For the complete Saltbox service history, use:
+
+```bash
+sudo journalctl -u saltbox_managed_docker_update_hosts.service
+```
+
+SDHM writes native journal priorities when systemd provides `JOURNAL_STREAM`, so warning-or-higher transitions can be filtered without parsing `MESSAGE`:
+
+```bash
+sudo journalctl -p warning -u saltbox_managed_docker_update_hosts.service
+```
+
+The implemented daemon transition records are:
+
+| Transition | Level / expected journal priority | Message and fields | Meaning |
+|---|---|---|---|
+| Process invocation | INFO / 6 | `starting SDHM`; `version`, `networks`, `default_network`, `interval`, `health_addr` | SDHM has been invoked. `health_addr` is the configured bound address and port. |
+| Initial reconciliation succeeds | INFO / 6 | `SDHM ready` | The listener is bound, preparation completed, and the first authoritative reconciliation succeeded. Health may now return 200 when no current concern is active. |
+| Initial reconciliation fails | WARN / 4 | `reconciliation failed`; `phase=initial`, `err`, `retry_in` | Initialization finished but the first reconciliation failed. Health remains 503 until its Docker or hosts concern succeeds. |
+| Later reconciliation fails | WARN / 4 | `reconciliation failed`; `err`, `retry_in` | A previously running reconciliation failed and will retry with bounded backoff. |
+| Reconciliation recovers | INFO / 6 | `reconciliation recovered` | A reconciliation succeeded after a logged reconciliation failure. |
+| Docker event stream fails | WARN / 4 | `Docker event stream unavailable`; `err`, `retry_in` | Event observation is unavailable and will reconnect with bounded backoff. |
+| Docker event stream recovers | INFO / 6 | `Docker event stream recovered`; `evidence=event` or `evidence=stable` | A previously failed stream delivered an event, or stayed connected for its stability interval. |
+| Marker repair succeeds | WARN / 4 | `hosts file recovered from validated backup` | Preparation restored corrupt target markers from a validated backup. |
+| Late replacement rollback succeeds | WARN / 4 | `reconciliation failed`; `err` includes `target restored from retained snapshot` | A replacement failed after changing the target, but SDHM restored the retained snapshot. |
+| Clean daemon completion | INFO / 6 | `SDHM stopped` | `Run` completed cleanly after shutdown cleanup; it is not emitted for a terminal daemon error. |
+| Terminal command error | ERROR / 3 | One concise error string, no fields | The command is exiting unsuccessfully; invalid configuration does not add a Cobra usage dump. |
+
+The `sdhm regenerate` command additionally records `regenerating hosts file` at INFO with its `path`, and either command warns `SDHM should run as root to modify the hosts file` when it is not running as root.
+
+SDHM intentionally does **not** log individual Docker events, container names, unmonitored networks, successful periodic no-op reconciliations, ordinary successful hosts mutations, repeated reconnect failures with the same error, abandoned health-response writes, or intentionally unpublishable endpoint omissions. This keeps the journal a bounded transition history instead of an update-by-update event feed.
+
+Native-priority prefix mapping is covered by local tests. This documentation does not claim live systemd journal-priority acceptance; that VM qualification remains pending.
+
 
 ## How It Works
 

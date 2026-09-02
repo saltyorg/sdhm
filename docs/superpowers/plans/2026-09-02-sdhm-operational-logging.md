@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-02-sdhm-operational-logging-design.md`
 
+**Implementation status:** The logging source contract is implemented through `2eeef4cdd234da4c9bc3258b124f5496ba2711bc`. Its canonical messages, fields, transition suppression, readiness and clean-stop meanings, and priority mapping are recorded in the linked design. Task 5 Steps 1--3 record that local contract; independent review, Linux artifact construction, and VM journal acceptance remain pending and must not be inferred from local tests.
+
 ## Global Constraints
 
 - Log state transitions only; do not log individual Docker events, container names, unmonitored networks, successful no-op reconciliations, or every successful hosts update.
@@ -519,7 +521,9 @@ git commit -m "feat(daemon): log event stream transitions"
 - Consumes: completed logging behavior and Saltbox VM lifecycle.
 - Produces: operator contract, exact committed-head local/VM evidence, and final review verdict.
 
-- [ ] **Step 1: Update operator and design documentation**
+**Phase A status (2026-09-02):** Steps 1--3 are recorded by the documentation-contract commit. They establish the local operator contract only. Step 4 remains controller-owned; Steps 5--10 remain pending, including all live `PRIORITY` and Saltbox VM assertions.
+
+- [x] **Step 1: Update operator and design documentation**
 
 Document the exact transition table from the logging spec, including:
 
@@ -532,7 +536,7 @@ Document the exact transition table from the logging spec, including:
 
 Update the original rewrite design's logging paragraph so it points to the operational logging spec. Set the logging design status to `Implemented; acceptance pending`. Add a short resolution entry to the written-spec review rather than rewriting its historical findings.
 
-- [ ] **Step 2: Run the complete local gate**
+- [x] **Step 2: Run the complete local gate**
 
 ```bash
 make check TEST_FLAGS='-count=1'
@@ -543,7 +547,7 @@ git status --short
 
 Expected: all package/race/vet/format/tidy/build gates pass and coverage is reported without a percentage gate.
 
-- [ ] **Step 3: Commit the documentation contract**
+- [x] **Step 3: Commit the documentation contract**
 
 ```bash
 git add README.md docs/superpowers/specs/2026-09-01-sdhm-go-1.27-rewrite-design.md docs/superpowers/reviews/2026-09-02-sdhm-go-1.27-rewrite-review.md docs/superpowers/specs/2026-09-02-sdhm-operational-logging-design.md docs/superpowers/plans/2026-09-02-sdhm-operational-logging.md
