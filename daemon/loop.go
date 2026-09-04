@@ -130,7 +130,7 @@ func (d *Daemon) loop(
 	}()
 
 	for {
-		if runErr, captured, stop := d.loopStop(ctx); stop {
+		if stop, captured, runErr := d.loopStop(ctx); stop {
 			return runErr, captured
 		}
 		if pending {
@@ -254,22 +254,22 @@ func loopStreamStopReady(ctx context.Context, serverDone <-chan struct{}) bool {
 	}
 }
 
-func (d *Daemon) loopStop(ctx context.Context) (error, bool, bool) {
+func (d *Daemon) loopStop(ctx context.Context) (bool, bool, error) {
 	select {
 	case <-d.server.Done():
 		serveErr := d.server.Err()
 		if serveErr != nil {
-			return fmt.Errorf("health server stopped: %w", serveErr), true, true
+			return true, true, fmt.Errorf("health server stopped: %w", serveErr)
 		}
-		return errHealthServerStopped, true, true
+		return true, true, errHealthServerStopped
 	default:
 	}
 
 	select {
 	case <-ctx.Done():
-		return nil, false, true
+		return true, false, nil
 	default:
-		return nil, false, false
+		return false, false, nil
 	}
 }
 

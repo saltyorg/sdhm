@@ -35,7 +35,6 @@ type Client struct {
 func New() (*Client, error) {
 	api, err := mobyclient.New(
 		mobyclient.WithHost(mobyclient.DefaultDockerHost),
-		mobyclient.WithAPIVersionNegotiation(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating Docker client: %w", err)

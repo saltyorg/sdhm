@@ -1344,7 +1344,7 @@ func TestLoopStreamFailureOutranksExpiredStabilityAfterBlockedReconcile(t *testi
 			}
 
 			failureAt := thirdCall.at.Add(streamStabilityDelay - time.Second)
-			advanceLoopTime(t, failureAt.Sub(time.Now()))
+			advanceLoopTime(t, time.Until(failureAt))
 			streamErr := errors.New("stream failure before stability threshold")
 			failLoopTestStream(thirdStream, streamErr)
 			advanceLoopTime(t, 2*time.Second)

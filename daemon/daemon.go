@@ -116,7 +116,7 @@ func (d *Daemon) Run(parent context.Context) error {
 			cancel()
 		}
 	}()
-	if runErr, captured, stop := d.startupStop(parent); stop {
+	if stop, captured, runErr := d.startupStop(parent); stop {
 		return finish(runErr, captured)
 	}
 
@@ -133,12 +133,12 @@ func (d *Daemon) Run(parent context.Context) error {
 		d.logger.Warn("hosts file recovered from validated backup")
 	}
 	d.tracker.Recover(health.ConcernRecovery)
-	if runErr, captured, stop := d.startupStop(parent); stop {
+	if stop, captured, runErr := d.startupStop(parent); stop {
 		return finish(runErr, captured)
 	}
 
 	initialReconcileErr := d.reconcile(ctx)
-	if runErr, captured, stop := d.startupStop(parent); stop {
+	if stop, captured, runErr := d.startupStop(parent); stop {
 		return finish(runErr, captured)
 	}
 	if parent.Err() == nil && ctx.Err() == nil {
@@ -154,7 +154,7 @@ func (d *Daemon) Run(parent context.Context) error {
 			)
 		}
 	}
-	if runErr, captured, stop := d.startupStop(parent); stop {
+	if stop, captured, runErr := d.startupStop(parent); stop {
 		return finish(runErr, captured)
 	}
 
@@ -184,19 +184,19 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	return nil
 }
 
-func (d *Daemon) startupStop(parent context.Context) (error, bool, bool) {
+func (d *Daemon) startupStop(parent context.Context) (bool, bool, error) {
 	if parent.Err() != nil {
-		return nil, false, true
+		return true, false, nil
 	}
 	select {
 	case <-d.server.Done():
 		serveErr := d.server.Err()
 		if serveErr != nil {
-			return fmt.Errorf("health server stopped: %w", serveErr), true, true
+			return true, true, fmt.Errorf("health server stopped: %w", serveErr)
 		}
-		return errHealthServerStopped, true, true
+		return true, true, errHealthServerStopped
 	default:
-		return nil, false, false
+		return false, false, nil
 	}
 }
 
