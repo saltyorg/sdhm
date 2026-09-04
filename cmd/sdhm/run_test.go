@@ -75,8 +75,10 @@ func TestRunDaemonWithLogsCleanStop(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			recorder := newRunLogRecorder()
+			lock := &wiringCloser{}
 			wiring := daemonWiring{
-				newDocker: func() (daemon.NetworkSource, error) { return &wiringNetworkSource{}, nil },
+				lockHostsFile: func(string) (io.Closer, error) { return lock, nil },
+				newDocker:     func() (daemon.NetworkSource, error) { return &wiringNetworkSource{}, nil },
 				newStore: func(string, string, string, string) daemon.HostStore {
 					return &wiringHostStore{}
 				},
@@ -111,7 +113,35 @@ func TestRunDaemonWithLogsCleanStop(t *testing.T) {
 			if stops != tt.wantStops {
 				t.Fatalf("SDHM stopped records = %d, want %d", stops, tt.wantStops)
 			}
+			if lock.closeCalls != 1 {
+				t.Fatalf("hosts lock close calls = %d, want 1", lock.closeCalls)
+			}
 		})
+	}
+}
+
+func TestRunDaemonWithLockFailureSkipsConstruction(t *testing.T) {
+	lockErr := errors.New("lock unavailable")
+	dockerCalls := 0
+	wiring := daemonWiring{
+		lockHostsFile: func(string) (io.Closer, error) { return nil, lockErr },
+		newDocker: func() (daemon.NetworkSource, error) {
+			dockerCalls++
+			return &wiringNetworkSource{}, nil
+		},
+	}
+
+	err := runDaemonWith(
+		t.Context(),
+		validCommandConfig(),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		wiring,
+	)
+	if !errors.Is(err, lockErr) {
+		t.Fatalf("runDaemonWith() error = %v, want %v", err, lockErr)
+	}
+	if dockerCalls != 0 {
+		t.Fatalf("Docker constructor calls = %d, want 0", dockerCalls)
 	}
 }
 
@@ -132,6 +162,7 @@ func TestRunDaemonWithWiresDependenciesInConstructionOrder(t *testing.T) {
 	source := &wiringNetworkSource{}
 	store := &wiringHostStore{}
 	server := newWiringHealthServer()
+	lock := &wiringCloser{}
 
 	var calls []string
 	var gotStoreArgs []string
@@ -140,6 +171,14 @@ func TestRunDaemonWithWiresDependenciesInConstructionOrder(t *testing.T) {
 	var gotDaemonConfig daemon.Config
 	var gotRunContext context.Context
 	wiring := daemonWiring{
+		lockHostsFile: func(hostsPath string) (io.Closer, error) {
+			calls = append(calls, "lock")
+			if hostsPath != cfg.HostsFile {
+				t.Errorf("lock hosts path = %q, want %q", hostsPath, cfg.HostsFile)
+			}
+			lock.onClose = func() { calls = append(calls, "lock-close") }
+			return lock, nil
+		},
 		newDocker: func() (daemon.NetworkSource, error) {
 			calls = append(calls, "docker")
 			return source, nil
@@ -201,7 +240,7 @@ func TestRunDaemonWithWiresDependenciesInConstructionOrder(t *testing.T) {
 		t.Fatalf("runDaemonWith() error = %v", err)
 	}
 
-	wantCalls := []string{"docker", "store", "tracker", "handler", "health-server", "daemon", "run"}
+	wantCalls := []string{"lock", "docker", "store", "tracker", "handler", "health-server", "daemon", "run", "lock-close"}
 	if !slices.Equal(calls, wantCalls) {
 		t.Errorf("construction calls = %v, want %v", calls, wantCalls)
 	}
@@ -226,8 +265,10 @@ func TestRunDaemonWithClosesDockerWhenDaemonConstructionFails(t *testing.T) {
 	constructErr := errors.New("construct daemon")
 	closeErr := errors.New("close Docker")
 	source := &wiringNetworkSource{closeErr: closeErr}
+	lock := &wiringCloser{}
 	wiring := daemonWiring{
-		newDocker: func() (daemon.NetworkSource, error) { return source, nil },
+		lockHostsFile: func(string) (io.Closer, error) { return lock, nil },
+		newDocker:     func() (daemon.NetworkSource, error) { return source, nil },
 		newStore: func(string, string, string, string) daemon.HostStore {
 			return &wiringHostStore{}
 		},
@@ -263,6 +304,47 @@ func TestRunDaemonWithClosesDockerWhenDaemonConstructionFails(t *testing.T) {
 	if source.closeCalls != 1 {
 		t.Errorf("Docker close calls = %d, want 1", source.closeCalls)
 	}
+	if lock.closeCalls != 1 {
+		t.Errorf("hosts lock close calls = %d, want 1", lock.closeCalls)
+	}
+}
+
+func TestRunDaemonWithJoinsRunnerAndLockCloseErrors(t *testing.T) {
+	runnerErr := errors.New("runner failed")
+	lockCloseErr := errors.New("lock close failed")
+	lock := &wiringCloser{closeErr: lockCloseErr}
+	wiring := daemonWiring{
+		lockHostsFile: func(string) (io.Closer, error) { return lock, nil },
+		newDocker:     func() (daemon.NetworkSource, error) { return &wiringNetworkSource{}, nil },
+		newStore: func(string, string, string, string) daemon.HostStore {
+			return &wiringHostStore{}
+		},
+		newTracker: health.NewTracker,
+		newHandler: health.NewHandler,
+		newHealthServer: func(string, http.Handler) daemon.HealthServer {
+			return newWiringHealthServer()
+		},
+		newDaemon: func(
+			daemon.Config,
+			daemon.NetworkSource,
+			daemon.HostStore,
+			*health.Tracker,
+			daemon.HealthServer,
+			*slog.Logger,
+		) (daemonRunner, error) {
+			return daemonRunnerFunc(func(context.Context) error { return runnerErr }), nil
+		},
+	}
+
+	err := runDaemonWith(
+		t.Context(),
+		validCommandConfig(),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		wiring,
+	)
+	if !errors.Is(err, runnerErr) || !errors.Is(err, lockCloseErr) {
+		t.Fatalf("runDaemonWith() error = %v, want joined runner and lock-close errors", err)
+	}
 }
 
 func TestRegenerateHostsWithUsesDefaultIndependentStore(t *testing.T) {
@@ -272,12 +354,23 @@ func TestRegenerateHostsWithUsesDefaultIndependentStore(t *testing.T) {
 		SectionName: "CONTAINERS",
 	}
 	regenerator := &wiringRegenerator{}
+	lock := &wiringCloser{}
 	var gotArgs []string
 
-	err := regenerateHostsWith(t.Context(), cfg, func(hostsPath, backupPath, sectionName, defaultNetwork string) hostsRegenerator {
-		gotArgs = []string{hostsPath, backupPath, sectionName, defaultNetwork}
-		return regenerator
-	})
+	err := regenerateHostsWith(
+		t.Context(),
+		cfg,
+		func(hostsPath string) (io.Closer, error) {
+			if hostsPath != cfg.HostsFile {
+				t.Errorf("lock hosts path = %q, want %q", hostsPath, cfg.HostsFile)
+			}
+			return lock, nil
+		},
+		func(hostsPath, backupPath, sectionName, defaultNetwork string) hostsRegenerator {
+			gotArgs = []string{hostsPath, backupPath, sectionName, defaultNetwork}
+			return regenerator
+		},
+	)
 	if err != nil {
 		t.Fatalf("regenerateHostsWith() error = %v", err)
 	}
@@ -288,6 +381,29 @@ func TestRegenerateHostsWithUsesDefaultIndependentStore(t *testing.T) {
 	}
 	if regenerator.calls != 1 {
 		t.Errorf("Regenerate() calls = %d, want 1", regenerator.calls)
+	}
+	if lock.closeCalls != 1 {
+		t.Errorf("hosts lock close calls = %d, want 1", lock.closeCalls)
+	}
+}
+
+func TestRegenerateHostsWithLockFailureSkipsStore(t *testing.T) {
+	lockErr := errors.New("lock unavailable")
+	storeCalls := 0
+	err := regenerateHostsWith(
+		t.Context(),
+		command.RegenerateConfig{HostsFile: "/tmp/hosts", BackupFile: "/tmp/hosts.backup", SectionName: "CONTAINERS"},
+		func(string) (io.Closer, error) { return nil, lockErr },
+		func(string, string, string, string) hostsRegenerator {
+			storeCalls++
+			return &wiringRegenerator{}
+		},
+	)
+	if !errors.Is(err, lockErr) {
+		t.Fatalf("regenerateHostsWith() error = %v, want %v", err, lockErr)
+	}
+	if storeCalls != 0 {
+		t.Fatalf("store constructor calls = %d, want 0", storeCalls)
 	}
 }
 
@@ -495,4 +611,18 @@ type wiringRegenerator struct {
 func (r *wiringRegenerator) Regenerate(context.Context) error {
 	r.calls++
 	return nil
+}
+
+type wiringCloser struct {
+	closeErr   error
+	closeCalls int
+	onClose    func()
+}
+
+func (c *wiringCloser) Close() error {
+	c.closeCalls++
+	if c.onClose != nil {
+		c.onClose()
+	}
+	return c.closeErr
 }

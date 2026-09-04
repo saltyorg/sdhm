@@ -29,6 +29,7 @@ type faultOps struct {
 	openDirs        []string
 	readbackPending bool
 	readbackBytes   []byte
+	beforeOpenRead  func(string)
 	afterOpenRead   func(string)
 	afterChown      func(string)
 	chmodModes      []fs.FileMode
@@ -90,6 +91,9 @@ func (o *faultOps) OpenReadNoFollow(path string) (readHandle, error) {
 	}
 	if err := o.fault(openOperation); err != nil {
 		return nil, err
+	}
+	if !readback && o.beforeOpenRead != nil {
+		o.beforeOpenRead(path)
 	}
 	file, err := o.base.OpenReadNoFollow(path)
 	if err != nil {
@@ -548,6 +552,84 @@ func TestReplaceFileSuccess(t *testing.T) {
 	if !slices.Equal(ops.callOrder, wantOrder) {
 		t.Errorf("file operation order = %q, want %q", ops.callOrder, wantOrder)
 	}
+}
+
+func TestReplaceFileIfUnchangedRejectsConcurrentDestinationChanges(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*testing.T, string)
+	}{
+		{
+			name: "content",
+			change: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("external\n"), 0o640); err != nil {
+					t.Fatalf("write concurrent content: %v", err)
+				}
+			},
+		},
+		{
+			name: "metadata",
+			change: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Chmod(path, 0o600); err != nil {
+					t.Fatalf("change concurrent mode: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target, metadata := createTarget(t, "old\n", 0o640)
+			expected := fileSnapshot{data: []byte("old\n"), metadata: metadata, exists: true}
+			ops := newFaultOps()
+			ops.beforeOpenRead = func(path string) {
+				ops.beforeOpenRead = nil
+				tt.change(t, path)
+			}
+			store := newStore(ops)
+
+			renamed, err := store.replaceFileIfUnchanged(t.Context(), target, []byte("new\n"), metadata, expected)
+			if !errors.Is(err, errConcurrentModification) {
+				t.Fatalf("replaceFileIfUnchanged() error = %v, want %v", err, errConcurrentModification)
+			}
+			if renamed {
+				t.Fatal("replaceFileIfUnchanged() renamed = true, want false")
+			}
+			assertNoTempFiles(t, target, ops.tempPaths)
+		})
+	}
+}
+
+func TestReplaceFileIfUnchangedRejectsConcurrentCreation(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "hosts")
+	metadata := defaultFileMetadata()
+	ops := newFaultOps()
+	ops.beforeOpenRead = func(path string) {
+		ops.beforeOpenRead = nil
+		if err := os.WriteFile(path, []byte("external\n"), 0o640); err != nil {
+			t.Fatalf("create concurrent destination: %v", err)
+		}
+	}
+	store := newStore(ops)
+
+	renamed, err := store.replaceFileIfUnchanged(
+		t.Context(),
+		target,
+		[]byte("new\n"),
+		metadata,
+		fileSnapshot{exists: false},
+	)
+	if !errors.Is(err, errConcurrentModification) {
+		t.Fatalf("replaceFileIfUnchanged() error = %v, want %v", err, errConcurrentModification)
+	}
+	if renamed {
+		t.Fatal("replaceFileIfUnchanged() renamed = true, want false")
+	}
+	assertFileContent(t, target, []byte("external\n"))
+	assertNoTempFiles(t, target, ops.tempPaths)
 }
 
 func TestReplaceFileRestrictsOwnedTempBeforeChownAndWrite(t *testing.T) {
@@ -1062,6 +1144,70 @@ func TestStoreApplyNoChangeLeavesBackupUntouched(t *testing.T) {
 	}
 	assertFileContent(t, target, current)
 	assertFileContent(t, backup, sentinelBackup)
+}
+
+func TestStoreApplyRejectsConcurrentTargetChange(t *testing.T) {
+	const current = "127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n10.0.0.1 old old.saltbox\n# END DOCKER CONTAINERS\n# unmanaged old\n"
+	target, backup := createStoreFiles(t, []byte(current), []byte(current))
+	ops := newFaultOps()
+	targetReads := 0
+	ops.beforeOpenRead = func(path string) {
+		if path != target {
+			return
+		}
+		targetReads++
+		if targetReads != 2 {
+			return
+		}
+		if err := os.WriteFile(target, []byte("external writer\n"), 0o640); err != nil {
+			t.Fatalf("write concurrent target: %v", err)
+		}
+	}
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+	store.ops = ops
+
+	err := store.Apply(t.Context(), []daemon.Endpoint{{
+		Network: "saltbox",
+		IP:      netip.MustParseAddr("172.18.0.2"),
+		Aliases: []string{"radarr"},
+	}})
+	if !errors.Is(err, errConcurrentModification) {
+		t.Fatalf("Apply() error = %v, want %v", err, errConcurrentModification)
+	}
+	assertFileContent(t, target, []byte("external writer\n"))
+	assertFileContent(t, backup, []byte(current))
+}
+
+func TestStoreApplyRejectsConcurrentBackupChange(t *testing.T) {
+	const current = "127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n10.0.0.1 old old.saltbox\n# END DOCKER CONTAINERS\n"
+	target, backup := createStoreFiles(t, []byte(current), []byte(current))
+	ops := newFaultOps()
+	backupReads := 0
+	ops.beforeOpenRead = func(path string) {
+		if path != backup {
+			return
+		}
+		backupReads++
+		if backupReads != 2 {
+			return
+		}
+		if err := os.WriteFile(backup, []byte("external backup writer\n"), 0o600); err != nil {
+			t.Fatalf("write concurrent backup: %v", err)
+		}
+	}
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+	store.ops = ops
+
+	err := store.Apply(t.Context(), []daemon.Endpoint{{
+		Network: "saltbox",
+		IP:      netip.MustParseAddr("172.18.0.2"),
+		Aliases: []string{"radarr"},
+	}})
+	if !errors.Is(err, errConcurrentModification) {
+		t.Fatalf("Apply() error = %v, want %v", err, errConcurrentModification)
+	}
+	assertFileContent(t, target, []byte(current))
+	assertFileContent(t, backup, []byte("external backup writer\n"))
 }
 
 func TestStoreApplyUsesConfiguredDefaultAcrossNetworks(t *testing.T) {

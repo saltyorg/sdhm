@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -26,6 +27,7 @@ type hostsRegenerator interface {
 }
 
 type daemonWiring struct {
+	lockHostsFile   func(string) (io.Closer, error)
 	newDocker       func() (daemon.NetworkSource, error)
 	newStore        func(string, string, string, string) daemon.HostStore
 	newTracker      func() *health.Tracker
@@ -56,6 +58,7 @@ func logStartup(logger *slog.Logger, cfg command.Config) {
 
 func productionDaemonWiring() daemonWiring {
 	return daemonWiring{
+		lockHostsFile: acquireHostsLock,
 		newDocker: func() (daemon.NetworkSource, error) {
 			return docker.New()
 		},
@@ -80,7 +83,15 @@ func productionDaemonWiring() daemonWiring {
 	}
 }
 
-func runDaemonWith(ctx context.Context, cfg command.Config, logger *slog.Logger, wiring daemonWiring) error {
+func runDaemonWith(ctx context.Context, cfg command.Config, logger *slog.Logger, wiring daemonWiring) (result error) {
+	lock, err := wiring.lockHostsFile(cfg.HostsFile)
+	if err != nil {
+		return fmt.Errorf("acquire hosts lock for %q: %w", cfg.HostsFile, err)
+	}
+	defer func() {
+		result = joinHostsLockClose(result, lock, cfg.HostsFile)
+	}()
+
 	source, err := wiring.newDocker()
 	if err != nil {
 		return fmt.Errorf("create Docker source: %w", err)
@@ -129,9 +140,14 @@ func regenerateHosts(ctx context.Context, cfg command.RegenerateConfig) error {
 	}
 	logger.Info("regenerating hosts file", "path", cfg.HostsFile)
 
-	err := regenerateHostsWith(ctx, cfg, func(hostsPath, backupPath, sectionName, defaultNetwork string) hostsRegenerator {
-		return hosts.NewStore(hostsPath, backupPath, sectionName, defaultNetwork)
-	})
+	err := regenerateHostsWith(
+		ctx,
+		cfg,
+		acquireHostsLock,
+		func(hostsPath, backupPath, sectionName, defaultNetwork string) hostsRegenerator {
+			return hosts.NewStore(hostsPath, backupPath, sectionName, defaultNetwork)
+		},
+	)
 	if err != nil {
 		return err
 	}
@@ -143,11 +159,27 @@ func regenerateHosts(ctx context.Context, cfg command.RegenerateConfig) error {
 func regenerateHostsWith(
 	ctx context.Context,
 	cfg command.RegenerateConfig,
+	lockHostsFile func(string) (io.Closer, error),
 	newStore func(string, string, string, string) hostsRegenerator,
-) error {
+) (result error) {
+	lock, err := lockHostsFile(cfg.HostsFile)
+	if err != nil {
+		return fmt.Errorf("acquire hosts lock for %q: %w", cfg.HostsFile, err)
+	}
+	defer func() {
+		result = joinHostsLockClose(result, lock, cfg.HostsFile)
+	}()
+
 	store := newStore(cfg.HostsFile, cfg.BackupFile, cfg.SectionName, "")
 	if err := store.Regenerate(ctx); err != nil {
 		return fmt.Errorf("regenerate hosts file: %w", err)
 	}
 	return nil
+}
+
+func joinHostsLockClose(primary error, lock io.Closer, hostsPath string) error {
+	if err := lock.Close(); err != nil {
+		return errors.Join(primary, fmt.Errorf("close hosts lock for %q: %w", hostsPath, err))
+	}
+	return primary
 }

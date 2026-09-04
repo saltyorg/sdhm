@@ -22,7 +22,15 @@ type fileMetadata struct {
 	setOwnership bool
 }
 
+type fileSnapshot struct {
+	data     []byte
+	metadata fileMetadata
+	exists   bool
+}
+
 const rollbackTimeout = 5 * time.Second
+
+var errConcurrentModification = errors.New("destination changed during replacement")
 
 type Store struct {
 	ops            fileOps
@@ -186,19 +194,21 @@ func (s *Store) Regenerate(ctx context.Context) error {
 // installs caller-validated proposed bytes, and restores only the target after
 // a failure that occurs after the target rename.
 func (s *Store) applyReplacement(ctx context.Context, current, proposed []byte, targetMetadata, newBackupMetadata fileMetadata) error {
-	_, backupMetadata, exists, err := s.readOptionalRegularFile(s.backupPath)
+	backup, backupMetadata, exists, err := s.readOptionalRegularFile(s.backupPath)
 	if err != nil {
 		return fmt.Errorf("inspect backup: %w", err)
 	}
+	backupSnapshot := fileSnapshot{data: backup, metadata: backupMetadata, exists: exists}
 	if !exists {
 		backupMetadata = newBackupMetadata
 	}
 
-	if _, err := s.replaceFile(ctx, s.backupPath, current, backupMetadata); err != nil {
+	if _, err := s.replaceFileIfUnchanged(ctx, s.backupPath, current, backupMetadata, backupSnapshot); err != nil {
 		return fmt.Errorf("refresh backup: %w", err)
 	}
 
-	renamed, err := s.replaceFile(ctx, s.hostsPath, proposed, targetMetadata)
+	targetSnapshot := fileSnapshot{data: current, metadata: targetMetadata, exists: true}
+	renamed, err := s.replaceFileIfUnchanged(ctx, s.hostsPath, proposed, targetMetadata, targetSnapshot)
 	if err == nil {
 		return nil
 	}
@@ -373,6 +383,26 @@ func requireValidMarkers(data []byte, beginMarker, endMarker string) error {
 // boolean reports whether the rename occurred, including when a later
 // durability or validation step fails.
 func (s *Store) replaceFile(ctx context.Context, target string, data []byte, metadata fileMetadata) (bool, error) {
+	return s.replaceFileWithExpectation(ctx, target, data, metadata, nil)
+}
+
+func (s *Store) replaceFileIfUnchanged(
+	ctx context.Context,
+	target string,
+	data []byte,
+	metadata fileMetadata,
+	expected fileSnapshot,
+) (bool, error) {
+	return s.replaceFileWithExpectation(ctx, target, data, metadata, &expected)
+}
+
+func (s *Store) replaceFileWithExpectation(
+	ctx context.Context,
+	target string,
+	data []byte,
+	metadata fileMetadata,
+	expected *fileSnapshot,
+) (bool, error) {
 	if err := checkContext(ctx, "create temporary file"); err != nil {
 		return false, err
 	}
@@ -444,6 +474,15 @@ func (s *Store) replaceFile(ctx context.Context, target string, data []byte, met
 		return false, cleanup(fmt.Errorf("close temporary file: %w", err))
 	}
 
+	if expected != nil {
+		if err := checkContext(ctx, "validate destination before rename"); err != nil {
+			return false, cleanup(err)
+		}
+		if err := s.requireSnapshot(target, *expected); err != nil {
+			return false, cleanup(err)
+		}
+	}
+
 	if err := checkContext(ctx, "rename temporary file"); err != nil {
 		return false, cleanup(err)
 	}
@@ -481,6 +520,17 @@ func (s *Store) replaceFile(ctx context.Context, target string, data []byte, met
 	}
 
 	return true, nil
+}
+
+func (s *Store) requireSnapshot(path string, expected fileSnapshot) error {
+	data, metadata, exists, err := s.readOptionalRegularFile(path)
+	if err != nil {
+		return fmt.Errorf("verify destination %q before replacement: %w", path, err)
+	}
+	if exists != expected.exists || (exists && (!bytes.Equal(data, expected.data) || metadata != expected.metadata)) {
+		return fmt.Errorf("%w: %q", errConcurrentModification, path)
+	}
+	return nil
 }
 
 // restoreTarget restores only target from caller-retained validated bytes. It
