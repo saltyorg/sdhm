@@ -193,8 +193,10 @@ func (s *Store) applyReplacement(ctx context.Context, current, proposed []byte, 
 		backupMetadata = newBackupMetadata
 	}
 
-	if _, err := s.replaceFileIfUnchanged(ctx, s.backupPath, current, backupMetadata, backupSnapshot); err != nil {
-		return fmt.Errorf("refresh backup: %w", err)
+	if !exists || !bytes.Equal(backup, current) {
+		if _, err := s.replaceFileIfUnchanged(ctx, s.backupPath, current, backupMetadata, backupSnapshot); err != nil {
+			return fmt.Errorf("refresh backup: %w", err)
+		}
 	}
 
 	targetSnapshot := fileSnapshot{data: current, metadata: targetMetadata, exists: true}

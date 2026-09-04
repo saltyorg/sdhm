@@ -267,7 +267,7 @@ make tidy-check
 # Run race-enabled tests
 make test-race
 
-# Run formatting, module, race, vet, and build gates
+# Run formatting, module, static analysis, vulnerability, race, vet, and build gates
 make check
 ```
 
@@ -299,8 +299,10 @@ Run `make help` to see all available targets:
  fmt-check        Check that tracked Go files are formatted
  vet              Run go vet
  tidy-check       Check module files without modifying them
+ staticcheck      Run pinned static analysis
+ vuln-check       Check reachable dependencies against the Go vulnerability database
  test-race        Run all tests with the race detector
- check            Run formatting, module, race, vet, and build gates
+ check            Run formatting, module, static analysis, vulnerability, race, vet, and build gates
  run              Run the application with example interval
  install          Install the binary to /usr/local/bin
  uninstall        Remove the binary from /usr/local/bin

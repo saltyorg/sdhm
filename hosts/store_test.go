@@ -1180,7 +1180,7 @@ func TestStoreApplyRejectsConcurrentTargetChange(t *testing.T) {
 
 func TestStoreApplyRejectsConcurrentBackupChange(t *testing.T) {
 	const current = "127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n10.0.0.1 old old.saltbox\n# END DOCKER CONTAINERS\n"
-	target, backup := createStoreFiles(t, []byte(current), []byte(current))
+	target, backup := createStoreFiles(t, []byte(current), []byte("stale backup\n"))
 	ops := newFaultOps()
 	backupReads := 0
 	ops.beforeOpenRead = func(path string) {
@@ -1254,7 +1254,7 @@ func TestStoreApplyReportsPostCommitMirrorFailureAndHealsOnRetry(t *testing.T) {
 	old := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n10.0.0.1 old old.saltbox\n# END DOCKER CONTAINERS\n")
 	target, backup := createStoreFiles(t, old, old)
 	ops := newFaultOps()
-	ops.failAt["write"] = 3
+	ops.failAt["write"] = 2
 	store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
 	store.ops = ops
 	endpoints := []daemon.Endpoint{{
@@ -1277,6 +1277,26 @@ func TestStoreApplyReportsPostCommitMirrorFailureAndHealsOnRetry(t *testing.T) {
 	}
 	assertFileContent(t, target, want)
 	assertFileContent(t, backup, want)
+}
+
+func TestStoreApplyDoesNotRewriteEqualPreimageBackup(t *testing.T) {
+	old := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n10.0.0.1 old old.saltbox\n# END DOCKER CONTAINERS\n")
+	target, backup := createStoreFiles(t, old, old)
+	ops := newFaultOps()
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+	store.ops = ops
+	endpoints := []daemon.Endpoint{{
+		Network: "saltbox",
+		IP:      netip.MustParseAddr("172.18.0.2"),
+		Aliases: []string{"radarr"},
+	}}
+
+	if err := store.Apply(t.Context(), endpoints); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if got := ops.calls["write"]; got != 2 {
+		t.Fatalf("write calls = %d, want target commit and current-mirror refresh only", got)
+	}
 }
 
 func TestStoreApplyValidationAndBackupFailuresLeaveTargetUnchanged(t *testing.T) {
