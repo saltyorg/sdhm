@@ -11,6 +11,7 @@ A daemon that automatically updates `/etc/hosts` with Docker container hostnames
 - **Current-State Health**: Reports active failures and retains bounded diagnostic history without time-based false recovery
 - **Validated Recovery**: Recovers corrupt managed markers only from a valid backup and otherwise fails without overwriting the target
 - **Transactional Updates**: Uses adjacent temporary files, durable atomic replacement, readback validation, and bounded rollback
+- **Single-Writer Safety**: Rejects overlapping daemon or regeneration processes for the same hosts file and detects concurrent destination changes before replacement
 - **Configurable Section Management**: Manages a clearly marked section in `/etc/hosts` while preserving other entries
 
 ## Requirements
@@ -225,7 +226,7 @@ Live systemd journal-priority acceptance passed on 2026-09-02 for reviewed code 
    172.18.0.3  webserver
    # END DOCKER CONTAINERS
    ```
-5. **Backup & Recovery**: Successful replacements refresh a valid backup transactionally. Corrupt markers are restored only from a backup with one valid ordered marker pair; a missing or invalid backup fails closed without replacing the target. Symlink, FIFO, directory, and other non-regular target or backup paths are rejected rather than replaced. `sdhm regenerate` remains available for an explicit fresh baseline.
+5. **Backup & Recovery**: Successful preparation, reconciliation, and regeneration leave the backup as a byte-identical current recovery mirror. Corrupt markers are restored only from a backup with one valid ordered marker pair; a missing or invalid backup fails closed without replacing the target. Symlink, FIFO, directory, and other non-regular target or backup paths are rejected rather than replaced. `sdhm regenerate` remains available for an explicit fresh baseline.
 
 ## Development
 

@@ -945,7 +945,7 @@ func TestStorePrepareStates(t *testing.T) {
 		corrupt = "127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n"
 	)
 
-	t.Run("valid target and valid backup stay byte-for-byte unchanged", func(t *testing.T) {
+	t.Run("valid target refreshes a stale valid backup", func(t *testing.T) {
 		target, backup := createStoreFiles(t, []byte(validA), []byte(validB))
 		store := NewStore(target, backup, section, "saltbox")
 
@@ -957,7 +957,7 @@ func TestStorePrepareStates(t *testing.T) {
 			t.Fatalf("Prepare() result = %+v, want zero result", result)
 		}
 		assertFileContent(t, target, []byte(validA))
-		assertFileContent(t, backup, []byte(validB))
+		assertFileContent(t, backup, []byte(validA))
 	})
 
 	t.Run("valid target seeds a missing backup", func(t *testing.T) {
@@ -1128,7 +1128,7 @@ func TestStorePrepareRejectsMissingAndNonRegularTargets(t *testing.T) {
 	})
 }
 
-func TestStoreApplyNoChangeLeavesBackupUntouched(t *testing.T) {
+func TestStoreApplyNoChangeRepairsBackupMirror(t *testing.T) {
 	current := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.2 radarr radarr.saltbox\n# END DOCKER CONTAINERS\n# suffix\n")
 	sentinelBackup := []byte("sentinel backup without markers\n")
 	target, backup := createStoreFiles(t, current, sentinelBackup)
@@ -1143,7 +1143,7 @@ func TestStoreApplyNoChangeLeavesBackupUntouched(t *testing.T) {
 		t.Fatalf("Apply() error = %v", err)
 	}
 	assertFileContent(t, target, current)
-	assertFileContent(t, backup, sentinelBackup)
+	assertFileContent(t, backup, current)
 }
 
 func TestStoreApplyRejectsConcurrentTargetChange(t *testing.T) {
@@ -1234,7 +1234,7 @@ func TestStoreApplyUsesConfiguredDefaultAcrossNetworks(t *testing.T) {
 		}
 		want := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.2 radarr radarr.saltbox\n172.20.0.2 radarr.backend\n# END DOCKER CONTAINERS\n# unmanaged suffix\n")
 		assertFileContent(t, target, want)
-		assertFileContent(t, backup, []byte(old))
+		assertFileContent(t, backup, want)
 	})
 
 	t.Run("secondary default moves the bare alias", func(t *testing.T) {
@@ -1246,8 +1246,37 @@ func TestStoreApplyUsesConfiguredDefaultAcrossNetworks(t *testing.T) {
 		}
 		want := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.20.0.2 radarr radarr.backend\n172.18.0.2 radarr.saltbox\n# END DOCKER CONTAINERS\n# unmanaged suffix\n")
 		assertFileContent(t, target, want)
-		assertFileContent(t, backup, []byte(old))
+		assertFileContent(t, backup, want)
 	})
+}
+
+func TestStoreApplyReportsPostCommitMirrorFailureAndHealsOnRetry(t *testing.T) {
+	old := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n10.0.0.1 old old.saltbox\n# END DOCKER CONTAINERS\n")
+	target, backup := createStoreFiles(t, old, old)
+	ops := newFaultOps()
+	ops.failAt["write"] = 3
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+	store.ops = ops
+	endpoints := []daemon.Endpoint{{
+		Network: "saltbox",
+		IP:      netip.MustParseAddr("172.18.0.2"),
+		Aliases: []string{"radarr"},
+	}}
+	want := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.2 radarr radarr.saltbox\n# END DOCKER CONTAINERS\n")
+
+	err := store.Apply(t.Context(), endpoints)
+	if !errors.Is(err, ops.failErr["write"]) {
+		t.Fatalf("Apply() error = %v, want post-commit backup write failure", err)
+	}
+	assertFileContent(t, target, want)
+	assertFileContent(t, backup, old)
+
+	ops.failAt["write"] = 0
+	if err := store.Apply(t.Context(), endpoints); err != nil {
+		t.Fatalf("Apply() retry error = %v", err)
+	}
+	assertFileContent(t, target, want)
+	assertFileContent(t, backup, want)
 }
 
 func TestStoreApplyValidationAndBackupFailuresLeaveTargetUnchanged(t *testing.T) {
@@ -1429,7 +1458,7 @@ func TestStoreRegenerateCreatesMissingTargetAndBackup(t *testing.T) {
 	assertFileMode(t, backup, 0o644)
 }
 
-func TestStoreRegenerateBacksUpValidPriorTarget(t *testing.T) {
+func TestStoreRegenerateMirrorsFreshTargetOverPriorBackup(t *testing.T) {
 	prior := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.2 old old.saltbox\n# END DOCKER CONTAINERS\n# retained suffix\n")
 	oldBackup := []byte("127.0.0.1 older\n# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n")
 	target, backup := createStoreFiles(t, prior, oldBackup)
@@ -1440,7 +1469,7 @@ func TestStoreRegenerateBacksUpValidPriorTarget(t *testing.T) {
 		t.Fatalf("Regenerate() error = %v", err)
 	}
 	assertFileContent(t, target, freshHostsFixture())
-	assertFileContent(t, backup, prior)
+	assertFileContent(t, backup, freshHostsFixture())
 }
 
 func TestStoreRegenerateCreatesMissingBackupWithDefaultMetadata(t *testing.T) {
@@ -1452,9 +1481,9 @@ func TestStoreRegenerateCreatesMissingBackupWithDefaultMetadata(t *testing.T) {
 		wantBackup []byte
 	}{
 		{
-			name:       "valid target becomes backup",
+			name:       "valid target is replaced by current mirror",
 			prior:      []byte(validPrior),
-			wantBackup: []byte(validPrior),
+			wantBackup: freshHostsFixture(),
 		},
 		{
 			name:       "corrupt target is never copied to backup",
@@ -1484,7 +1513,7 @@ func TestStoreRegenerateCreatesMissingBackupWithDefaultMetadata(t *testing.T) {
 	}
 }
 
-func TestStoreRegeneratePreservesValidBackupWhenPriorTargetIsCorrupt(t *testing.T) {
+func TestStoreRegenerateRefreshesValidBackupWhenPriorTargetIsCorrupt(t *testing.T) {
 	corrupt := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n")
 	validBackup := []byte("127.0.0.1 recovery\n# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n")
 	target, backup := createStoreFiles(t, corrupt, validBackup)
@@ -1498,7 +1527,7 @@ func TestStoreRegeneratePreservesValidBackupWhenPriorTargetIsCorrupt(t *testing.
 		t.Fatalf("Regenerate() error = %v", err)
 	}
 	assertFileContent(t, target, freshHostsFixture())
-	assertFileContent(t, backup, validBackup)
+	assertFileContent(t, backup, freshHostsFixture())
 	assertFileMode(t, backup, 0o600)
 }
 

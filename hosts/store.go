@@ -74,7 +74,7 @@ func (s *Store) Prepare(ctx context.Context) (daemon.PrepareResult, error) {
 	}
 	state, _, markerErr := locateMarkers(current, s.beginMarker, s.endMarker)
 	if markerErr == nil && state == validMarkers {
-		if err := s.ensureBackup(ctx, current, metadata); err != nil {
+		if err := s.ensureBackupMatches(ctx, current, metadata); err != nil {
 			return daemon.PrepareResult{}, err
 		}
 		return daemon.PrepareResult{}, nil
@@ -97,7 +97,8 @@ func (s *Store) Prepare(ctx context.Context) (daemon.PrepareResult, error) {
 	if err := requireValidMarkers(backup, s.beginMarker, s.endMarker); err != nil {
 		return daemon.PrepareResult{}, fmt.Errorf("recover corrupt hosts file: invalid backup: %w", errors.Join(markerErr, err))
 	}
-	if err := s.restoreTarget(ctx, s.hostsPath, backup, metadata); err != nil {
+	expectedTarget := fileSnapshot{data: current, metadata: metadata, exists: true}
+	if err := s.restoreTargetIfUnchanged(ctx, s.hostsPath, backup, metadata, expectedTarget); err != nil {
 		return daemon.PrepareResult{}, fmt.Errorf("recover corrupt hosts file: %w", err)
 	}
 	return daemon.PrepareResult{RecoveredFromBackup: true}, nil
@@ -130,14 +131,14 @@ func (s *Store) Apply(ctx context.Context, endpoints []daemon.Endpoint) error {
 		return fmt.Errorf("validate proposed hosts file: %w", err)
 	}
 	if bytes.Equal(current, proposed) {
-		return nil
+		return s.ensureBackupMatches(ctx, current, metadata)
 	}
 
 	return s.applyReplacement(ctx, current, proposed, metadata, metadata)
 }
 
-// Regenerate replaces the hosts file with Ubuntu-compatible baseline content.
-// A valid prior target becomes the backup; corrupt target bytes never do.
+// Regenerate replaces the hosts file with Ubuntu-compatible baseline content
+// and leaves the backup as a current validated mirror.
 func (s *Store) Regenerate(ctx context.Context) error {
 	if err := checkContext(ctx, "regenerate hosts file"); err != nil {
 		return err
@@ -168,31 +169,20 @@ func (s *Store) Regenerate(ctx context.Context) error {
 		}
 	}
 
-	backup, backupMetadata, backupExists, err := s.readOptionalRegularFile(s.backupPath)
-	if err != nil {
-		return fmt.Errorf("inspect backup: %w", err)
-	}
-	backupValid := false
-	if backupExists {
-		backupValid = requireValidMarkers(backup, s.beginMarker, s.endMarker) == nil
-	} else {
-		backupMetadata = defaultFileMetadata()
-	}
-	if !backupValid {
-		if _, err := s.replaceFile(ctx, s.backupPath, fresh, backupMetadata); err != nil {
-			return fmt.Errorf("seed regenerated backup: %w", err)
-		}
+	if err := s.ensureBackupMatches(ctx, fresh, defaultFileMetadata()); err != nil {
+		return fmt.Errorf("seed regenerated backup: %w", err)
 	}
 
-	if _, err := s.replaceFile(ctx, s.hostsPath, fresh, targetMetadata); err != nil {
+	expectedTarget := fileSnapshot{data: current, metadata: targetMetadata, exists: targetExists}
+	if _, err := s.replaceFileIfUnchanged(ctx, s.hostsPath, fresh, targetMetadata, expectedTarget); err != nil {
 		return fmt.Errorf("replace hosts file with regenerated content: %w", err)
 	}
 	return nil
 }
 
-// applyReplacement refreshes the backup from caller-validated current bytes,
-// installs caller-validated proposed bytes, and restores only the target after
-// a failure that occurs after the target rename.
+// applyReplacement retains the caller-validated current bytes in the backup,
+// installs caller-validated proposed bytes, refreshes the backup to the
+// committed target, and restores only the target after a late target failure.
 func (s *Store) applyReplacement(ctx context.Context, current, proposed []byte, targetMetadata, newBackupMetadata fileMetadata) error {
 	backup, backupMetadata, exists, err := s.readOptionalRegularFile(s.backupPath)
 	if err != nil {
@@ -210,13 +200,17 @@ func (s *Store) applyReplacement(ctx context.Context, current, proposed []byte, 
 	targetSnapshot := fileSnapshot{data: current, metadata: targetMetadata, exists: true}
 	renamed, err := s.replaceFileIfUnchanged(ctx, s.hostsPath, proposed, targetMetadata, targetSnapshot)
 	if err == nil {
+		if err := s.ensureBackupMatches(ctx, proposed, newBackupMetadata); err != nil {
+			return fmt.Errorf("refresh committed backup: %w", err)
+		}
 		return nil
 	}
 	primaryErr := fmt.Errorf("replace hosts file: %w", err)
 	if !renamed {
 		return primaryErr
 	}
-	rollbackErr := s.rollbackTarget(ctx, s.hostsPath, current, targetMetadata)
+	committedSnapshot := fileSnapshot{data: proposed, metadata: targetMetadata, exists: true}
+	rollbackErr := s.rollbackTarget(ctx, s.hostsPath, current, targetMetadata, committedSnapshot)
 	if rollbackErr == nil {
 		return fmt.Errorf("%w; target restored from retained snapshot", primaryErr)
 	}
@@ -226,38 +220,32 @@ func (s *Store) applyReplacement(ctx context.Context, current, proposed []byte, 
 	)
 }
 
-func (s *Store) ensureBackup(ctx context.Context, validTarget []byte, targetMetadata fileMetadata) error {
+func (s *Store) ensureBackupMatches(ctx context.Context, validTarget []byte, targetMetadata fileMetadata) error {
 	backup, metadata, exists, err := s.readOptionalRegularFile(s.backupPath)
 	if err != nil {
 		return fmt.Errorf("inspect backup: %w", err)
 	}
-	if exists {
-		if err := requireValidMarkers(backup, s.beginMarker, s.endMarker); err == nil {
-			return nil
-		}
-	} else {
+	if exists && bytes.Equal(backup, validTarget) {
+		return nil
+	}
+	backupSnapshot := fileSnapshot{data: backup, metadata: metadata, exists: exists}
+	if !exists {
 		metadata = targetMetadata
 	}
 
-	if _, err := s.replaceFile(ctx, s.backupPath, validTarget, metadata); err != nil {
-		return fmt.Errorf("seed backup: %w", err)
+	if _, err := s.replaceFileIfUnchanged(ctx, s.backupPath, validTarget, metadata, backupSnapshot); err != nil {
+		return fmt.Errorf("refresh backup mirror: %w", err)
 	}
 	return nil
 }
 
 func (s *Store) initializeManagedSection(ctx context.Context, current, proposed []byte, targetMetadata fileMetadata) error {
-	_, backupMetadata, exists, err := s.readOptionalRegularFile(s.backupPath)
-	if err != nil {
-		return fmt.Errorf("inspect backup: %w", err)
-	}
-	if !exists {
-		backupMetadata = targetMetadata
-	}
-	if _, err := s.replaceFile(ctx, s.backupPath, proposed, backupMetadata); err != nil {
+	if err := s.ensureBackupMatches(ctx, proposed, targetMetadata); err != nil {
 		return fmt.Errorf("seed initialized backup: %w", err)
 	}
 
-	renamed, err := s.replaceFile(ctx, s.hostsPath, proposed, targetMetadata)
+	targetSnapshot := fileSnapshot{data: current, metadata: targetMetadata, exists: true}
+	renamed, err := s.replaceFileIfUnchanged(ctx, s.hostsPath, proposed, targetMetadata, targetSnapshot)
 	if err == nil {
 		return nil
 	}
@@ -265,14 +253,21 @@ func (s *Store) initializeManagedSection(ctx context.Context, current, proposed 
 	if !renamed {
 		return primaryErr
 	}
-	rollbackErr := s.rollbackTarget(ctx, s.hostsPath, current, targetMetadata)
+	committedSnapshot := fileSnapshot{data: proposed, metadata: targetMetadata, exists: true}
+	rollbackErr := s.rollbackTarget(ctx, s.hostsPath, current, targetMetadata, committedSnapshot)
 	return errors.Join(primaryErr, rollbackErr)
 }
 
-func (s *Store) rollbackTarget(ctx context.Context, target string, retainedValidatedBytes []byte, metadata fileMetadata) error {
+func (s *Store) rollbackTarget(
+	ctx context.Context,
+	target string,
+	retainedValidatedBytes []byte,
+	metadata fileMetadata,
+	expected fileSnapshot,
+) error {
 	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
 	defer cancel()
-	return s.restoreTarget(rollbackCtx, target, retainedValidatedBytes, metadata)
+	return s.restoreTargetIfUnchanged(rollbackCtx, target, retainedValidatedBytes, metadata, expected)
 }
 
 func (s *Store) readRegularFile(path string) ([]byte, fileMetadata, error) {
@@ -537,6 +532,20 @@ func (s *Store) requireSnapshot(path string, expected fileSnapshot) error {
 // deliberately has no backup behavior and does not attempt recursive rollback.
 func (s *Store) restoreTarget(ctx context.Context, target string, retainedValidatedBytes []byte, metadata fileMetadata) error {
 	_, err := s.replaceFile(ctx, target, retainedValidatedBytes, metadata)
+	if err != nil {
+		return fmt.Errorf("restore target %q: %w", target, err)
+	}
+	return nil
+}
+
+func (s *Store) restoreTargetIfUnchanged(
+	ctx context.Context,
+	target string,
+	retainedValidatedBytes []byte,
+	metadata fileMetadata,
+	expected fileSnapshot,
+) error {
+	_, err := s.replaceFileIfUnchanged(ctx, target, retainedValidatedBytes, metadata, expected)
 	if err != nil {
 		return fmt.Errorf("restore target %q: %w", target, err)
 	}
