@@ -11,11 +11,19 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/events"
 	mobyclient "github.com/moby/moby/client"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/saltyorg/sdhm/daemon"
 )
 
 var _ daemon.NetworkSource = (*Client)(nil)
+
+const maxConcurrentInspects = 8
+
+type inspectOutcome struct {
+	result mobyclient.ContainerInspectResult
+	err    error
+}
 
 type apiClient interface {
 	Ping(context.Context, mobyclient.PingOptions) (mobyclient.PingResult, error)
@@ -69,9 +77,22 @@ func (c *Client) Snapshot(ctx context.Context, networks []string) ([]daemon.Endp
 		return nil, fmt.Errorf("listing Docker containers: %w", err)
 	}
 
+	outcomes := make([]inspectOutcome, len(listed.Items))
+	var inspections errgroup.Group
+	inspections.SetLimit(maxConcurrentInspects)
+	for i, item := range listed.Items {
+		inspections.Go(func() error {
+			outcomes[i].result, outcomes[i].err = c.api.ContainerInspect(ctx, item.ID, mobyclient.ContainerInspectOptions{})
+			return nil
+		})
+	}
+	if err := inspections.Wait(); err != nil {
+		return nil, fmt.Errorf("wait for Docker container inspections: %w", err)
+	}
+
 	endpoints := make([]daemon.Endpoint, 0, len(listed.Items))
-	for _, item := range listed.Items {
-		inspected, err := c.api.ContainerInspect(ctx, item.ID, mobyclient.ContainerInspectOptions{})
+	for i, item := range listed.Items {
+		inspected, err := outcomes[i].result, outcomes[i].err
 		if err != nil {
 			if errdefs.IsNotFound(err) {
 				continue

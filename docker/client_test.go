@@ -3,8 +3,10 @@ package docker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -238,6 +240,120 @@ func TestSnapshotAbortsOnOtherInspectError(t *testing.T) {
 	if got != nil {
 		t.Fatalf("Snapshot() endpoints = %v, want discarded result", got)
 	}
+}
+
+func TestSnapshotBoundsConcurrentInspects(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		api := newFakeAPI()
+		ids := make([]string, maxConcurrentInspects*2+1)
+		for i := range ids {
+			ids[i] = fmt.Sprintf("container-%02d", i)
+		}
+		api.listFn = func(context.Context, mobyclient.ContainerListOptions) (mobyclient.ContainerListResult, error) {
+			return listResult(ids...), nil
+		}
+
+		var active atomic.Int32
+		var maximum atomic.Int32
+		started := make(chan struct{}, len(ids))
+		release := make(chan struct{})
+		api.inspectFn = func(ctx context.Context, _ string, _ mobyclient.ContainerInspectOptions) (mobyclient.ContainerInspectResult, error) {
+			current := active.Add(1)
+			defer active.Add(-1)
+			for {
+				observed := maximum.Load()
+				if current <= observed || maximum.CompareAndSwap(observed, current) {
+					break
+				}
+			}
+			started <- struct{}{}
+			select {
+			case <-release:
+				return mobyclient.ContainerInspectResult{}, nil
+			case <-ctx.Done():
+				return mobyclient.ContainerInspectResult{}, ctx.Err()
+			}
+		}
+
+		type snapshotResult struct {
+			endpoints []daemon.Endpoint
+			err       error
+		}
+		result := make(chan snapshotResult, 1)
+		go func() {
+			endpoints, err := newClient(api).Snapshot(t.Context(), []string{"saltbox"})
+			result <- snapshotResult{endpoints: endpoints, err: err}
+		}()
+
+		synctest.Wait()
+		if got := len(started); got != maxConcurrentInspects {
+			close(release)
+			t.Fatalf("concurrent inspections started = %d, want %d", got, maxConcurrentInspects)
+		}
+		close(release)
+		synctest.Wait()
+		got := <-result
+		if got.err != nil {
+			t.Fatalf("Snapshot() error = %v", got.err)
+		}
+		if len(got.endpoints) != 0 {
+			t.Fatalf("Snapshot() endpoints = %v, want empty", got.endpoints)
+		}
+		if got := maximum.Load(); got != maxConcurrentInspects {
+			t.Fatalf("maximum concurrent inspections = %d, want %d", got, maxConcurrentInspects)
+		}
+	})
+}
+
+func TestSnapshotSelectsFatalInspectErrorByListOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		api := newFakeAPI()
+		api.listFn = func(context.Context, mobyclient.ContainerListOptions) (mobyclient.ContainerListResult, error) {
+			return listResult("first", "second"), nil
+		}
+		firstErr := errors.New("first inspect failed")
+		secondErr := errors.New("second inspect failed")
+		releaseFirst := make(chan struct{})
+		var secondStarted atomic.Bool
+		api.inspectFn = func(ctx context.Context, id string, _ mobyclient.ContainerInspectOptions) (mobyclient.ContainerInspectResult, error) {
+			switch id {
+			case "first":
+				select {
+				case <-releaseFirst:
+					return mobyclient.ContainerInspectResult{}, firstErr
+				case <-ctx.Done():
+					return mobyclient.ContainerInspectResult{}, ctx.Err()
+				}
+			case "second":
+				secondStarted.Store(true)
+				return mobyclient.ContainerInspectResult{}, secondErr
+			default:
+				t.Fatalf("unexpected container ID %q", id)
+				return mobyclient.ContainerInspectResult{}, nil
+			}
+		}
+
+		result := make(chan error, 1)
+		go func() {
+			_, err := newClient(api).Snapshot(t.Context(), []string{"saltbox"})
+			result <- err
+		}()
+		synctest.Wait()
+		if !secondStarted.Load() {
+			close(releaseFirst)
+			t.Fatal("second inspection did not start while the first was blocked")
+		}
+		close(releaseFirst)
+		synctest.Wait()
+
+		err := <-result
+		if !errors.Is(err, firstErr) {
+			t.Fatalf("Snapshot() error = %v, want first list-order error %v", err, firstErr)
+		}
+		if errors.Is(err, secondErr) {
+			t.Fatalf("Snapshot() error = %v, do not want later list-order error %v", err, secondErr)
+		}
+	})
 }
 
 func TestSnapshotSkipsDisconnectedConfiguredNetwork(t *testing.T) {
