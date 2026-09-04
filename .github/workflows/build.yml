@@ -6,6 +6,7 @@ on:
       - main
     tags:
       - '*'
+  pull_request:
 
 permissions:
   contents: read
@@ -25,12 +26,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
 
@@ -87,10 +88,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
 
@@ -115,7 +116,7 @@ jobs:
           go build -trimpath -ldflags="${ldflags}" -o build/${OUTPUT_NAME} ./cmd/sdhm
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.APP_NAME }}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
           path: build/${{ env.APP_NAME }}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
@@ -130,12 +131,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: ${{ env.APP_NAME }}_*
@@ -176,7 +177,7 @@ jobs:
           echo "**Full Changelog**: https://github.com/saltyorg/sdhm/compare/$PREVIOUS_TAG...${{ needs.prepare.outputs.version }}" >> release_notes.md
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:

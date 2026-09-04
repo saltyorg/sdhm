@@ -19,7 +19,7 @@ TEST_FLAGS ?=
 # Build flags
 LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
 
-.PHONY: all build clean test test-short test-coverage deps update tidy fmt vet help run install uninstall fmt-check tidy-check test-race check
+.PHONY: all build clean test test-short test-coverage deps update tidy fmt vet staticcheck vuln-check help run install uninstall fmt-check tidy-check test-race check
 
 # Default target
 ## all: Run tests and build the binary
@@ -62,8 +62,8 @@ tidy-check:
 test-race:
 	$(GOTEST) -race $(TEST_FLAGS) $(TEST_PACKAGES)
 
-## check: Run formatting, module, race, vet, and build gates
-check: fmt-check tidy-check test-race vet build
+## check: Run formatting, module, static analysis, vulnerability, race, vet, and build gates
+check: fmt-check tidy-check staticcheck vuln-check test-race vet build
 
 ## test-short: Run short tests
 test-short:
@@ -103,6 +103,14 @@ fmt:
 vet:
 	@echo "Running go vet..."
 	$(GOVET) ./...
+
+## staticcheck: Run pinned static analysis
+staticcheck:
+	$(GOCMD) tool staticcheck ./...
+
+## vuln-check: Check reachable dependencies against the Go vulnerability database
+vuln-check:
+	$(GOCMD) tool govulncheck ./...
 
 ## run: Run the application with example interval (requires root for /etc/hosts)
 run:
