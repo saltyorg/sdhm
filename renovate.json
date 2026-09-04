@@ -1,0 +1,35 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":separateMajorReleases",
+    ":ignoreUnstable"
+  ],
+  "automerge": false,
+  "ignoreDeps": [
+    "github.com/moby/moby/api"
+  ],
+  "packageRules": [
+    {
+      "description": "Moby client owns the compatible API module floor",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "github.com/moby/moby/client"
+      ],
+      "groupName": "moby-sdk",
+      "postUpdateOptions": [
+        "gomodTidy"
+      ]
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "addLabels": [
+      "security",
+      "vulnerability"
+    ]
+  }
+}
