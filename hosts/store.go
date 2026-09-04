@@ -398,123 +398,177 @@ func (s *Store) replaceFileWithExpectation(
 	metadata fileMetadata,
 	expected *fileSnapshot,
 ) (bool, error) {
-	if err := checkContext(ctx, "create temporary file"); err != nil {
+	tempPath, err := s.stageReplacement(ctx, target, data, metadata)
+	if err != nil {
 		return false, err
+	}
+	return s.commitReplacement(ctx, tempPath, target, data, expected)
+}
+
+func (s *Store) stageReplacement(
+	ctx context.Context,
+	target string,
+	data []byte,
+	metadata fileMetadata,
+) (stagedPath string, result error) {
+	if err := checkContext(ctx, "create temporary file"); err != nil {
+		return "", err
 	}
 
 	parent := filepath.Dir(target)
 	temp, err := s.ops.CreateTemp(parent, "."+filepath.Base(target)+".tmp-*")
 	if err != nil {
-		return false, fmt.Errorf("create temporary file for %q: %w", target, err)
+		return "", fmt.Errorf("create temporary file for %q: %w", target, err)
 	}
 	tempPath := temp.Name()
 	closeAttempted := false
-	cleanup := func(primary error) error {
-		joined := primary
-		if !closeAttempted {
-			if closeErr := temp.Close(); closeErr != nil {
-				joined = errors.Join(joined, fmt.Errorf("close temporary file %q: %w", tempPath, closeErr))
-			}
-			closeAttempted = true
+	defer func() {
+		if result != nil {
+			result = s.cleanupTemporary(temp, tempPath, closeAttempted, result)
 		}
-		if removeErr := s.ops.Remove(tempPath); removeErr != nil {
-			joined = errors.Join(joined, fmt.Errorf("remove temporary file %q: %w", tempPath, removeErr))
-		}
-		return joined
+	}()
+
+	if err := configureTemporaryOwnership(ctx, temp, metadata); err != nil {
+		return "", err
 	}
-
-	if metadata.setOwnership {
-		if err := checkContext(ctx, "restrict temporary file mode"); err != nil {
-			return false, cleanup(err)
-		}
-		if err := temp.Chmod(0); err != nil {
-			return false, cleanup(fmt.Errorf("restrict temporary file mode: %w", err))
-		}
-
-		if err := checkContext(ctx, "set temporary file ownership"); err != nil {
-			return false, cleanup(err)
-		}
-		if err := temp.Chown(metadata.uid, metadata.gid); err != nil {
-			return false, cleanup(fmt.Errorf("set temporary file ownership: %w", err))
-		}
+	if err := writeAndSyncTemporary(ctx, temp, data, metadata.mode); err != nil {
+		return "", err
 	}
+	closeAttempted = true
+	if err := temp.Close(); err != nil {
+		return "", fmt.Errorf("close temporary file: %w", err)
+	}
+	return tempPath, nil
+}
 
+func configureTemporaryOwnership(ctx context.Context, temp syncFile, metadata fileMetadata) error {
+	if !metadata.setOwnership {
+		return nil
+	}
+	if err := checkContext(ctx, "restrict temporary file mode"); err != nil {
+		return err
+	}
+	if err := temp.Chmod(0); err != nil {
+		return fmt.Errorf("restrict temporary file mode: %w", err)
+	}
+	if err := checkContext(ctx, "set temporary file ownership"); err != nil {
+		return err
+	}
+	if err := temp.Chown(metadata.uid, metadata.gid); err != nil {
+		return fmt.Errorf("set temporary file ownership: %w", err)
+	}
+	return nil
+}
+
+func writeAndSyncTemporary(ctx context.Context, temp syncFile, data []byte, mode fs.FileMode) error {
 	if err := checkContext(ctx, "write temporary file"); err != nil {
-		return false, cleanup(err)
+		return err
 	}
 	written, err := temp.Write(data)
 	if err != nil {
-		return false, cleanup(fmt.Errorf("write temporary file: %w", err))
+		return fmt.Errorf("write temporary file: %w", err)
 	}
 	if written != len(data) {
-		return false, cleanup(fmt.Errorf("write temporary file: %w", io.ErrShortWrite))
+		return fmt.Errorf("write temporary file: %w", io.ErrShortWrite)
 	}
-
 	if err := checkContext(ctx, "set final temporary file mode"); err != nil {
-		return false, cleanup(err)
+		return err
 	}
-	if err := temp.Chmod(metadata.mode); err != nil {
-		return false, cleanup(fmt.Errorf("set final temporary file mode: %w", err))
+	if err := temp.Chmod(mode); err != nil {
+		return fmt.Errorf("set final temporary file mode: %w", err)
 	}
-
 	if err := checkContext(ctx, "sync temporary file"); err != nil {
-		return false, cleanup(err)
+		return err
 	}
 	if err := temp.Sync(); err != nil {
-		return false, cleanup(fmt.Errorf("sync temporary file: %w", err))
+		return fmt.Errorf("sync temporary file: %w", err)
 	}
+	return nil
+}
 
-	closeAttempted = true
-	if err := temp.Close(); err != nil {
-		return false, cleanup(fmt.Errorf("close temporary file: %w", err))
+func (s *Store) cleanupTemporary(temp syncFile, tempPath string, closeAttempted bool, primary error) error {
+	if !closeAttempted {
+		if closeErr := temp.Close(); closeErr != nil {
+			primary = errors.Join(primary, fmt.Errorf("close temporary file %q: %w", tempPath, closeErr))
+		}
+	}
+	if removeErr := s.ops.Remove(tempPath); removeErr != nil {
+		primary = errors.Join(primary, fmt.Errorf("remove temporary file %q: %w", tempPath, removeErr))
+	}
+	return primary
+}
+
+func (s *Store) commitReplacement(
+	ctx context.Context,
+	tempPath string,
+	target string,
+	data []byte,
+	expected *fileSnapshot,
+) (bool, error) {
+	cleanup := func(primary error) (bool, error) {
+		if removeErr := s.ops.Remove(tempPath); removeErr != nil {
+			primary = errors.Join(primary, fmt.Errorf("remove temporary file %q: %w", tempPath, removeErr))
+		}
+		return false, primary
 	}
 
 	if expected != nil {
 		if err := checkContext(ctx, "validate destination before rename"); err != nil {
-			return false, cleanup(err)
+			return cleanup(err)
 		}
 		if err := s.requireSnapshot(target, *expected); err != nil {
-			return false, cleanup(err)
+			return cleanup(err)
 		}
 	}
 
 	if err := checkContext(ctx, "rename temporary file"); err != nil {
-		return false, cleanup(err)
+		return cleanup(err)
 	}
 	if err := s.ops.Rename(tempPath, target); err != nil {
-		return false, cleanup(fmt.Errorf("rename temporary file over %q: %w", target, err))
+		return cleanup(fmt.Errorf("rename temporary file over %q: %w", target, err))
 	}
 
-	if err := checkContext(ctx, "open parent directory"); err != nil {
+	if err := s.syncParentDirectory(ctx, filepath.Dir(target)); err != nil {
 		return true, err
+	}
+	if err := s.validateReplacement(ctx, target, data); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func (s *Store) syncParentDirectory(ctx context.Context, parent string) error {
+	if err := checkContext(ctx, "open parent directory"); err != nil {
+		return err
 	}
 	dir, err := s.ops.OpenDir(parent)
 	if err != nil {
-		return true, fmt.Errorf("open parent directory %q: %w", parent, err)
+		return fmt.Errorf("open parent directory %q: %w", parent, err)
 	}
-
 	if err := checkContext(ctx, "sync parent directory"); err != nil {
-		return true, joinDirClose(err, dir, parent)
+		return joinDirClose(err, dir, parent)
 	}
 	if err := dir.Sync(); err != nil {
-		return true, joinDirClose(fmt.Errorf("sync parent directory %q: %w", parent, err), dir, parent)
+		return joinDirClose(fmt.Errorf("sync parent directory %q: %w", parent, err), dir, parent)
 	}
 	if err := dir.Close(); err != nil {
-		return true, fmt.Errorf("close parent directory %q: %w", parent, err)
+		return fmt.Errorf("close parent directory %q: %w", parent, err)
 	}
+	return nil
+}
 
+func (s *Store) validateReplacement(ctx context.Context, target string, data []byte) error {
 	if err := checkContext(ctx, "read destination back"); err != nil {
-		return true, err
+		return err
 	}
 	readback, _, err := s.readRegularFile(target)
 	if err != nil {
-		return true, fmt.Errorf("read destination %q back: %w", target, err)
+		return fmt.Errorf("read destination %q back: %w", target, err)
 	}
 	if !bytes.Equal(readback, data) {
-		return true, fmt.Errorf("read destination %q back: content mismatch", target)
+		return fmt.Errorf("read destination %q back: content mismatch", target)
 	}
-
-	return true, nil
+	return nil
 }
 
 func (s *Store) requireSnapshot(path string, expected fileSnapshot) error {
