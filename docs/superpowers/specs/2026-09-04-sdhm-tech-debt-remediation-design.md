@@ -83,5 +83,5 @@ Local acceptance requires the complete SDHM gate, shuffled repetitions,
 coverage, module verification, and clean diffs. Standalone behavior is qualified
 on an Ubuntu 26.04 toolbox guest with isolated Docker networks and temporary
 hosts files. The Saltbox exact-pin path is qualified separately on an Ubuntu
-26.04 core guest. The handoff is an exact source commit, five Linux artifacts,
+26.04 minimal guest. The handoff is an exact source commit, five Linux artifacts,
 their SHA-256 manifest, and an evidence record; it is not a release.
