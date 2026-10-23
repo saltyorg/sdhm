@@ -41,10 +41,28 @@ type PrepareResult struct {
 	RecoveredFromBackup bool
 }
 
+// AliasConflictEndpoint identifies one network address claiming a hostname.
+type AliasConflictEndpoint struct {
+	Network string
+	IP      netip.Addr
+}
+
+// AliasConflict describes a hostname omitted because networks claim different addresses.
+// Hostname is lowercase and Endpoints are ordered by network and address.
+type AliasConflict struct {
+	Hostname  string
+	Endpoints []AliasConflictEndpoint
+}
+
+// ApplyResult reports omissions from a successfully committed hosts snapshot.
+type ApplyResult struct {
+	Conflicts []AliasConflict
+}
+
 // HostStore prepares and updates the managed hosts file.
 type HostStore interface {
 	Prepare(context.Context) (PrepareResult, error)
-	Apply(context.Context, []Endpoint) error
+	Apply(context.Context, []Endpoint) (ApplyResult, error)
 }
 
 // HealthServer serves the daemon health endpoint and owns its listener.

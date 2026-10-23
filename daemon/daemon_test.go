@@ -134,7 +134,7 @@ func (s *orderedStore) Prepare(ctx context.Context) (PrepareResult, error) {
 	return s.prepareResult, s.prepareErr
 }
 
-func (s *orderedStore) Apply(ctx context.Context, endpoints []Endpoint) error {
+func (s *orderedStore) Apply(ctx context.Context, endpoints []Endpoint) (ApplyResult, error) {
 	s.log.add("hosts_apply")
 	s.mu.Lock()
 	s.applyContexts = append(s.applyContexts, ctx)
@@ -144,12 +144,12 @@ func (s *orderedStore) Apply(ctx context.Context, endpoints []Endpoint) error {
 		s.onApply(ctx)
 	}
 	if s.applyErr != nil {
-		return s.applyErr
+		return ApplyResult{}, s.applyErr
 	}
 	s.mu.Lock()
 	s.current = cloneEndpoints(endpoints)
 	s.mu.Unlock()
-	return nil
+	return ApplyResult{}, nil
 }
 
 func (s *orderedStore) calls() ([]context.Context, [][]Endpoint, []Endpoint) {

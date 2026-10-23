@@ -16,6 +16,7 @@ const (
 	ConcernDockerSnapshot Concern = "docker_snapshot"
 	ConcernDockerEvents   Concern = "docker_events"
 	ConcernHostsApply     Concern = "hosts_apply"
+	ConcernAliasConflicts Concern = "alias_conflicts"
 	ConcernRecovery       Concern = "recovery"
 )
 
@@ -37,6 +38,7 @@ var concernDetailsByConcern = map[Concern]concernDetails{
 	ConcernDockerSnapshot: {errorType: "docker", severity: SeverityMajor},
 	ConcernDockerEvents:   {errorType: "docker_events", severity: SeverityMinor},
 	ConcernHostsApply:     {errorType: "update", severity: SeverityMajor},
+	ConcernAliasConflicts: {errorType: "alias_conflicts", severity: SeverityMajor},
 	ConcernRecovery:       {errorType: "validation", severity: SeverityCritical},
 }
 

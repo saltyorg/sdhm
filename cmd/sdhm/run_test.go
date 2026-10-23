@@ -586,7 +586,9 @@ func (*wiringHostStore) Prepare(context.Context) (daemon.PrepareResult, error) {
 	return daemon.PrepareResult{}, nil
 }
 
-func (*wiringHostStore) Apply(context.Context, []daemon.Endpoint) error { return nil }
+func (*wiringHostStore) Apply(context.Context, []daemon.Endpoint) (daemon.ApplyResult, error) {
+	return daemon.ApplyResult{}, nil
+}
 
 type wiringHealthServer struct {
 	done chan struct{}

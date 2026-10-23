@@ -110,6 +110,8 @@ sdhm --hosts-file /tmp/test-hosts --networks bridge
 
 The resolved default network receives both `alias` and `alias.<network>` names. Every secondary network receives only `alias.<network>`, preventing bare-name collisions. `--default-network` must name a monitored network. When it is omitted, `saltbox` is preferred if present; otherwise the first configured network becomes the default. Existing startup commands using only `--networks`, `--interval`, and `--health-port` therefore require no new flag.
 
+If a generated hostname refers to different addresses across monitored networks, SDHM omits that hostname from every affected entry and continues updating all unambiguous names. Hostname comparisons ignore case. For example, a default-network alias `web.backend` can collide with alias `web` on network `backend`; other aliases such as `web.backend.saltbox` remain available. An endpoint with no remaining names is omitted. Health stays degraded while a collision persists, and SDHM restores the omitted names automatically after a successful reconciliation without that collision. The journal records the conflicting hostname, networks, and addresses when the conflict appears or changes, and records its recovery once it clears. Names shared within one network and names referring to the same address across networks retain their existing behavior.
+
 The hosts and backup paths must identify different destinations, including when relative paths or symlinked parent directories refer to the same destination. The backup cannot use the adjacent `<hosts-file>.sdhm.lock` path reserved for writer exclusion. SDHM rejects these configurations before acquiring the lock or modifying either file.
 
 ### Time Duration Formats
@@ -136,7 +138,7 @@ Response:
 }
 ```
 
-From the moment the listener starts, the endpoint returns HTTP 503 with `message: "System initializing"` until hosts preparation and the first reconciliation attempt have completed. This readiness gate does not add an error record. After initialization, the endpoint returns HTTP 200 only when no concern is currently active and HTTP 503 while Docker snapshots, event streaming, hosts updates, or recovery remain failed. A failed first reconciliation therefore stays at 503 under its actual Docker or hosts concern. A concern clears only after that same operation succeeds; elapsed time alone never marks it recovered. Up to ten historical records remain available for diagnosis, so `error_count` is retained history rather than the number of active concerns. Active records use `unknown` recovery fields, while superseded or recovered records use `0s`.
+From the moment the listener starts, the endpoint returns HTTP 503 with `message: "System initializing"` until hosts preparation and the first reconciliation attempt have completed. This readiness gate does not add an error record. After initialization, the endpoint returns HTTP 200 only when no concern is currently active and HTTP 503 while Docker snapshots, event streaming, hosts updates, recovery, or alias collisions remain unresolved. A failed first reconciliation therefore stays at 503 under its actual Docker or hosts concern. Alias collisions use `error_type: "alias_conflicts"`; other entries continue updating while this concern is active. A concern clears only after that same operation succeeds; elapsed time alone never marks it recovered. Up to ten historical records remain available for diagnosis, so `error_count` is retained history rather than the number of active concerns. Active records use `unknown` recovery fields, while superseded or recovered records use `0s`.
 
 ## Running as a System Service
 
@@ -204,6 +206,8 @@ The implemented daemon transition records are:
 | Reconciliation recovers | INFO / 6 | `reconciliation recovered` | A reconciliation succeeded after a logged reconciliation failure. |
 | Docker event stream fails | WARN / 4 | `Docker event stream unavailable`; `err`, `retry_in` | Event observation is unavailable and will reconnect with bounded backoff. |
 | Docker event stream recovers | INFO / 6 | `Docker event stream recovered`; `evidence=event` or `evidence=stable` | A previously failed stream delivered an event, or stayed connected for its stability interval. |
+| Hostname collision appears or changes | ERROR / 3 | `conflicting hostnames omitted`; `conflicts` identifies hostnames, networks, and addresses | Ambiguous names were omitted from a successful update; unambiguous entries continue updating and health remains degraded. |
+| Hostname collisions clear | INFO / 6 | `hosts alias conflicts resolved` | A successful update no longer has conflicting names; the alias concern clears. |
 | Marker repair succeeds | WARN / 4 | `hosts file recovered from validated backup` | Preparation restored corrupt target markers from a validated backup. |
 | Late replacement rollback succeeds | WARN / 4 | `reconciliation failed`; `err` includes `target restored from retained snapshot` | A replacement failed after changing the target, but SDHM restored the retained snapshot. |
 | Clean daemon completion | INFO / 6 | `SDHM stopped` | `Run` completed cleanly after shutdown cleanup; it is not emitted for a terminal daemon error. |
@@ -211,7 +215,7 @@ The implemented daemon transition records are:
 
 The `sdhm regenerate` command additionally records `regenerating hosts file` at INFO with its `path`, and either command warns `SDHM should run as root to modify the hosts file` when it is not running as root.
 
-SDHM intentionally does **not** log individual Docker events, container names, unmonitored networks, successful periodic no-op reconciliations, ordinary successful hosts mutations, repeated reconnect failures with the same error, abandoned health-response writes, or intentionally unpublishable endpoint omissions. This keeps the journal a bounded transition history instead of an update-by-update event feed.
+SDHM intentionally does **not** log individual Docker events, healthy container names, unmonitored networks, successful periodic no-op reconciliations, ordinary successful hosts mutations, repeated reconnect failures with the same error, unchanged hostname collisions, abandoned health-response writes, or intentionally unpublishable endpoint omissions. This keeps the journal a bounded transition history instead of an update-by-update event feed.
 
 Live systemd journal-priority acceptance passed on 2026-09-02 for reviewed code head `1e725d1283a05c8776415ce8422b8025f8a79cc5` and its static linux/amd64 artifact (SHA-256 `3a2dcbd7ada7c9d07751be6609af3af9e42c81e5b4e0022d5c100a3599dbb76a`) on an Ubuntu 26.04 `minimal` VM using isolated synthetic networks and temporary hosts files. This qualification does not cover a real Saltbox service deployment, a `core`-profile run, a release artifact, or the final documentation-head artifact (`340aaf06a2901271709d366f99333c6a8c14b9fd`; local build SHA-256 `628fadc3a765e169f14903577282b836533368f3d46b602729e7c9f825e80617`), which was not VM-run.
 

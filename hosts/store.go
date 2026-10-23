@@ -105,36 +105,40 @@ func (s *Store) Prepare(ctx context.Context) (daemon.PrepareResult, error) {
 }
 
 // Apply replaces the managed body from one complete endpoint snapshot.
-func (s *Store) Apply(ctx context.Context, endpoints []daemon.Endpoint) error {
+func (s *Store) Apply(ctx context.Context, endpoints []daemon.Endpoint) (daemon.ApplyResult, error) {
 	if err := checkContext(ctx, "apply hosts snapshot"); err != nil {
-		return err
+		return daemon.ApplyResult{}, err
 	}
 
 	current, metadata, err := s.readRegularFile(s.hostsPath)
 	if err != nil {
-		return fmt.Errorf("read hosts file: %w", err)
+		return daemon.ApplyResult{}, fmt.Errorf("read hosts file: %w", err)
 	}
 	state, section, err := locateMarkers(current, s.beginMarker, s.endMarker)
 	if err != nil {
-		return fmt.Errorf("validate hosts file: %w", err)
+		return daemon.ApplyResult{}, fmt.Errorf("validate hosts file: %w", err)
 	}
 	if state != validMarkers {
-		return fmt.Errorf("validate hosts file: managed markers are missing")
+		return daemon.ApplyResult{}, fmt.Errorf("validate hosts file: managed markers are missing")
 	}
 
-	body, err := renderEndpoints(endpoints, s.defaultNetwork)
+	body, conflicts, err := renderEndpoints(endpoints, s.defaultNetwork)
 	if err != nil {
-		return fmt.Errorf("render hosts entries: %w", err)
+		return daemon.ApplyResult{}, fmt.Errorf("render hosts entries: %w", err)
 	}
 	proposed := replaceManagedSection(current, section, body)
 	if err := requireValidMarkers(proposed, s.beginMarker, s.endMarker); err != nil {
-		return fmt.Errorf("validate proposed hosts file: %w", err)
+		return daemon.ApplyResult{}, fmt.Errorf("validate proposed hosts file: %w", err)
 	}
 	if bytes.Equal(current, proposed) {
-		return s.ensureBackupMatches(ctx, current, metadata)
+		err = s.ensureBackupMatches(ctx, current, metadata)
+	} else {
+		err = s.applyReplacement(ctx, current, proposed, metadata, metadata)
 	}
-
-	return s.applyReplacement(ctx, current, proposed, metadata, metadata)
+	if err != nil {
+		return daemon.ApplyResult{}, err
+	}
+	return daemon.ApplyResult{Conflicts: conflicts}, nil
 }
 
 // Regenerate replaces the hosts file with Ubuntu-compatible baseline content

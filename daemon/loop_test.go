@@ -67,13 +67,13 @@ func (*loopTestStore) Prepare(context.Context) (PrepareResult, error) {
 	return PrepareResult{}, nil
 }
 
-func (s *loopTestStore) Apply(ctx context.Context, _ []Endpoint) error {
+func (s *loopTestStore) Apply(ctx context.Context, _ []Endpoint) (ApplyResult, error) {
 	call := int(s.count.Add(1))
 	s.applyCalls <- call
 	if s.onApply != nil {
-		return s.onApply(ctx, call)
+		return ApplyResult{}, s.onApply(ctx, call)
 	}
-	return nil
+	return ApplyResult{}, nil
 }
 
 func newLoopTestSource() *loopTestSource {

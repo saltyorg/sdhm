@@ -107,6 +107,7 @@ func TestTrackerConcernMappings(t *testing.T) {
 		{ConcernDockerSnapshot, "docker", SeverityMajor},
 		{ConcernDockerEvents, "docker_events", SeverityMinor},
 		{ConcernHostsApply, "update", SeverityMajor},
+		{ConcernAliasConflicts, "alias_conflicts", SeverityMajor},
 		{ConcernRecovery, "validation", SeverityCritical},
 	}
 

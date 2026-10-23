@@ -24,6 +24,8 @@ type Daemon struct {
 	server  HealthServer
 	logger  *slog.Logger
 	timing  timingConfig
+
+	lastAliasConflicts string
 }
 
 // New validates the daemon's typed configuration and dependencies.
@@ -185,13 +187,15 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	}
 	d.tracker.Recover(health.ConcernDockerSnapshot)
 
-	if err := d.store.Apply(ctx, endpoints); err != nil {
+	result, err := d.store.Apply(ctx, endpoints)
+	if err != nil {
 		if ctx.Err() == nil || !errors.Is(err, ctx.Err()) {
 			d.tracker.Fail(health.ConcernHostsApply, err.Error())
 		}
 		return fmt.Errorf("apply hosts snapshot: %w", err)
 	}
 	d.tracker.Recover(health.ConcernHostsApply)
+	d.observeAliasConflicts(ctx, result.Conflicts)
 	return nil
 }
 

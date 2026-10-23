@@ -1139,7 +1139,7 @@ func TestStoreApplyNoChangeRepairsBackupMirror(t *testing.T) {
 		Aliases: []string{"radarr"},
 	}}
 
-	if err := store.Apply(t.Context(), endpoints); err != nil {
+	if _, err := store.Apply(t.Context(), endpoints); err != nil {
 		t.Fatalf("Apply() error = %v", err)
 	}
 	assertFileContent(t, target, current)
@@ -1166,7 +1166,7 @@ func TestStoreApplyRejectsConcurrentTargetChange(t *testing.T) {
 	store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
 	store.ops = ops
 
-	err := store.Apply(t.Context(), []daemon.Endpoint{{
+	_, err := store.Apply(t.Context(), []daemon.Endpoint{{
 		Network: "saltbox",
 		IP:      netip.MustParseAddr("172.18.0.2"),
 		Aliases: []string{"radarr"},
@@ -1198,7 +1198,7 @@ func TestStoreApplyRejectsConcurrentBackupChange(t *testing.T) {
 	store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
 	store.ops = ops
 
-	err := store.Apply(t.Context(), []daemon.Endpoint{{
+	_, err := store.Apply(t.Context(), []daemon.Endpoint{{
 		Network: "saltbox",
 		IP:      netip.MustParseAddr("172.18.0.2"),
 		Aliases: []string{"radarr"},
@@ -1229,7 +1229,7 @@ func TestStoreApplyUsesConfiguredDefaultAcrossNetworks(t *testing.T) {
 		target, backup := createStoreFiles(t, []byte(old), []byte("old backup sentinel\n"))
 		store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
 
-		if err := store.Apply(t.Context(), endpoints); err != nil {
+		if _, err := store.Apply(t.Context(), endpoints); err != nil {
 			t.Fatalf("Apply() error = %v", err)
 		}
 		want := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.2 radarr radarr.saltbox\n172.20.0.2 radarr.backend\n# END DOCKER CONTAINERS\n# unmanaged suffix\n")
@@ -1241,13 +1241,214 @@ func TestStoreApplyUsesConfiguredDefaultAcrossNetworks(t *testing.T) {
 		target, backup := createStoreFiles(t, []byte(old), nil)
 		store := NewStore(target, backup, "DOCKER CONTAINERS", "backend")
 
-		if err := store.Apply(t.Context(), endpoints); err != nil {
+		if _, err := store.Apply(t.Context(), endpoints); err != nil {
 			t.Fatalf("Apply() error = %v", err)
 		}
 		want := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.20.0.2 radarr radarr.backend\n172.18.0.2 radarr.saltbox\n# END DOCKER CONTAINERS\n# unmanaged suffix\n")
 		assertFileContent(t, target, want)
 		assertFileContent(t, backup, want)
 	})
+}
+
+func TestStoreApplyOmitsConflictingHostnamesAndRestoresAfterRecovery(t *testing.T) {
+	const old = "127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n10.0.0.1 old old.saltbox\n# END DOCKER CONTAINERS\n# unmanaged suffix\n"
+	target, backup := createStoreFiles(t, []byte(old), []byte(old))
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+	endpoints := []daemon.Endpoint{
+		{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.2"), Aliases: []string{"web.backend", "service"}},
+		{Network: "backend", IP: netip.MustParseAddr("172.20.0.2"), Aliases: []string{"web", "worker"}},
+		{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.3"), Aliases: []string{"healthy"}},
+	}
+	result, err := store.Apply(t.Context(), endpoints)
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	want := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.3 healthy healthy.saltbox\n172.18.0.2 service service.saltbox web.backend.saltbox\n172.20.0.2 worker.backend\n# END DOCKER CONTAINERS\n# unmanaged suffix\n")
+	assertFileContent(t, target, want)
+	assertFileContent(t, backup, want)
+	assertAliasConflicts(t, result.Conflicts, []daemon.AliasConflict{{
+		Hostname: "web.backend",
+		Endpoints: []daemon.AliasConflictEndpoint{
+			{Network: "backend", IP: netip.MustParseAddr("172.20.0.2")},
+			{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.2")},
+		},
+	}})
+	unchanged, err := store.Apply(t.Context(), endpoints)
+	if err != nil {
+		t.Fatalf("Apply() unchanged collision error = %v", err)
+	}
+	assertAliasConflicts(t, unchanged.Conflicts, result.Conflicts)
+
+	result, err = store.Apply(t.Context(), []daemon.Endpoint{endpoints[0], endpoints[2]})
+	if err != nil {
+		t.Fatalf("Apply() after resolving collision error = %v", err)
+	}
+	if len(result.Conflicts) != 0 {
+		t.Fatalf("Apply() after resolving collision conflicts = %+v, want none", result.Conflicts)
+	}
+	want = []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.3 healthy healthy.saltbox\n172.18.0.2 service service.saltbox web.backend web.backend.saltbox\n# END DOCKER CONTAINERS\n# unmanaged suffix\n")
+	assertFileContent(t, target, want)
+	assertFileContent(t, backup, want)
+}
+
+func TestStoreApplyCollisionRules(t *testing.T) {
+	const empty = "127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n"
+	tests := []struct {
+		name      string
+		endpoints []daemon.Endpoint
+		body      string
+		conflicts []daemon.AliasConflict
+	}{
+		{
+			name: "hostname matching ignores case and removes empty rows",
+			endpoints: []daemon.Endpoint{
+				{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.2"), Aliases: []string{"Web.Backend"}},
+				{Network: "backend", IP: netip.MustParseAddr("172.20.0.2"), Aliases: []string{"web"}},
+			},
+			body: "172.18.0.2 Web.Backend.saltbox\n",
+			conflicts: []daemon.AliasConflict{{
+				Hostname: "web.backend",
+				Endpoints: []daemon.AliasConflictEndpoint{
+					{Network: "backend", IP: netip.MustParseAddr("172.20.0.2")},
+					{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.2")},
+				},
+			}},
+		},
+		{
+			name: "dotted networks can collide with dotted aliases",
+			endpoints: []daemon.Endpoint{
+				{Network: "backend", IP: netip.MustParseAddr("172.20.0.2"), Aliases: []string{"api.prod"}},
+				{Network: "prod.backend", IP: netip.MustParseAddr("172.21.0.2"), Aliases: []string{"api"}},
+			},
+			conflicts: []daemon.AliasConflict{{
+				Hostname: "api.prod.backend",
+				Endpoints: []daemon.AliasConflictEndpoint{
+					{Network: "backend", IP: netip.MustParseAddr("172.20.0.2")},
+					{Network: "prod.backend", IP: netip.MustParseAddr("172.21.0.2")},
+				},
+			}},
+		},
+		{
+			name: "same address claimed by networks remains publishable",
+			endpoints: []daemon.Endpoint{
+				{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.2"), Aliases: []string{"web.backend"}},
+				{Network: "backend", IP: netip.MustParseAddr("172.18.0.2"), Aliases: []string{"web"}},
+			},
+			body: "172.18.0.2 web.backend\n172.18.0.2 web.backend web.backend.saltbox\n",
+		},
+		{
+			name: "same network shared alias retains its existing behavior",
+			endpoints: []daemon.Endpoint{
+				{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.2"), Aliases: []string{"web"}},
+				{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.3"), Aliases: []string{"web"}},
+			},
+			body: "172.18.0.2 web web.saltbox\n172.18.0.3 web web.saltbox\n",
+		},
+		{
+			name: "mixed shared ownership still detects cross network conflict",
+			endpoints: []daemon.Endpoint{
+				{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.2"), Aliases: []string{"web.backend"}},
+				{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.3"), Aliases: []string{"web.backend"}},
+				{Network: "backend", IP: netip.MustParseAddr("172.18.0.2"), Aliases: []string{"web"}},
+			},
+			body: "172.18.0.2 web.backend.saltbox\n172.18.0.3 web.backend.saltbox\n",
+			conflicts: []daemon.AliasConflict{{
+				Hostname: "web.backend",
+				Endpoints: []daemon.AliasConflictEndpoint{
+					{Network: "backend", IP: netip.MustParseAddr("172.18.0.2")},
+					{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.2")},
+					{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.3")},
+				},
+			}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target, backup := createStoreFiles(t, []byte(empty), []byte(empty))
+			store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+			for _, reverse := range []bool{false, true} {
+				endpoints := slices.Clone(tt.endpoints)
+				if reverse {
+					slices.Reverse(endpoints)
+				}
+				result, err := store.Apply(t.Context(), endpoints)
+				if err != nil {
+					t.Fatalf("Apply() error = %v", err)
+				}
+				assertAliasConflicts(t, result.Conflicts, tt.conflicts)
+				want := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n" + tt.body + "# END DOCKER CONTAINERS\n")
+				assertFileContent(t, target, want)
+				assertFileContent(t, backup, want)
+			}
+		})
+	}
+}
+
+func TestStoreApplyDoesNotReportCollisionOmissionsAfterFailedCommit(t *testing.T) {
+	const old = "127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n"
+	const partial = "127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.2 web.backend.saltbox\n# END DOCKER CONTAINERS\n"
+	tests := []struct {
+		name       string
+		failedCall int
+		wantTarget string
+	}{
+		{name: "target replacement fails", failedCall: 1, wantTarget: old},
+		{name: "committed backup mirror fails", failedCall: 2, wantTarget: partial},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target, backup := createStoreFiles(t, []byte(old), []byte(old))
+			store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+			ops := newFaultOps()
+			ops.failAt["write"] = tt.failedCall
+			store.ops = ops
+			result, err := store.Apply(t.Context(), []daemon.Endpoint{
+				{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.2"), Aliases: []string{"web.backend"}},
+				{Network: "backend", IP: netip.MustParseAddr("172.20.0.2"), Aliases: []string{"web"}},
+			})
+			if !errors.Is(err, ops.failErr["write"]) {
+				t.Fatalf("Apply() error = %v, want injected write failure", err)
+			}
+			if len(result.Conflicts) != 0 {
+				t.Fatalf("failed Apply() conflicts = %+v, want no successful-update result", result.Conflicts)
+			}
+			assertFileContent(t, target, []byte(tt.wantTarget))
+			assertFileContent(t, backup, []byte(old))
+		})
+	}
+}
+
+func TestStoreApplySortsMultipleConflicts(t *testing.T) {
+	const old = "# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n"
+	target, backup := createStoreFiles(t, []byte(old), []byte(old))
+	store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
+	result, err := store.Apply(t.Context(), []daemon.Endpoint{
+		{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.2"), Aliases: []string{"z.backend", "a.backend"}},
+		{Network: "backend", IP: netip.MustParseAddr("172.20.0.2"), Aliases: []string{"z", "a"}},
+	})
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	owners := []daemon.AliasConflictEndpoint{
+		{Network: "backend", IP: netip.MustParseAddr("172.20.0.2")},
+		{Network: "saltbox", IP: netip.MustParseAddr("172.18.0.2")},
+	}
+	assertAliasConflicts(t, result.Conflicts, []daemon.AliasConflict{
+		{Hostname: "a.backend", Endpoints: owners},
+		{Hostname: "z.backend", Endpoints: owners},
+	})
+	want := []byte("# BEGIN DOCKER CONTAINERS\n172.18.0.2 a.backend.saltbox z.backend.saltbox\n# END DOCKER CONTAINERS\n")
+	assertFileContent(t, target, want)
+	assertFileContent(t, backup, want)
+}
+
+func assertAliasConflicts(t *testing.T, got, want []daemon.AliasConflict) {
+	t.Helper()
+	if !slices.EqualFunc(got, want, func(left, right daemon.AliasConflict) bool {
+		return left.Hostname == right.Hostname && slices.Equal(left.Endpoints, right.Endpoints)
+	}) {
+		t.Fatalf("Apply() conflicts = %+v, want %+v", got, want)
+	}
 }
 
 func TestStoreApplyReportsPostCommitMirrorFailureAndHealsOnRetry(t *testing.T) {
@@ -1264,7 +1465,7 @@ func TestStoreApplyReportsPostCommitMirrorFailureAndHealsOnRetry(t *testing.T) {
 	}}
 	want := []byte("127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n172.18.0.2 radarr radarr.saltbox\n# END DOCKER CONTAINERS\n")
 
-	err := store.Apply(t.Context(), endpoints)
+	_, err := store.Apply(t.Context(), endpoints)
 	if !errors.Is(err, ops.failErr["write"]) {
 		t.Fatalf("Apply() error = %v, want post-commit backup write failure", err)
 	}
@@ -1272,7 +1473,7 @@ func TestStoreApplyReportsPostCommitMirrorFailureAndHealsOnRetry(t *testing.T) {
 	assertFileContent(t, backup, old)
 
 	ops.failAt["write"] = 0
-	if err := store.Apply(t.Context(), endpoints); err != nil {
+	if _, err := store.Apply(t.Context(), endpoints); err != nil {
 		t.Fatalf("Apply() retry error = %v", err)
 	}
 	assertFileContent(t, target, want)
@@ -1291,7 +1492,7 @@ func TestStoreApplyDoesNotRewriteEqualPreimageBackup(t *testing.T) {
 		Aliases: []string{"radarr"},
 	}}
 
-	if err := store.Apply(t.Context(), endpoints); err != nil {
+	if _, err := store.Apply(t.Context(), endpoints); err != nil {
 		t.Fatalf("Apply() error = %v", err)
 	}
 	if got := ops.calls["write"]; got != 2 {
@@ -1312,7 +1513,7 @@ func TestStoreApplyValidationAndBackupFailuresLeaveTargetUnchanged(t *testing.T)
 			Aliases: []string{"radarr"},
 		}}
 
-		if err := store.Apply(t.Context(), endpoints); err == nil {
+		if _, err := store.Apply(t.Context(), endpoints); err == nil {
 			t.Fatal("Apply() error = nil, want default-network validation error")
 		}
 		assertFileContent(t, target, []byte(old))
@@ -1329,7 +1530,7 @@ func TestStoreApplyValidationAndBackupFailuresLeaveTargetUnchanged(t *testing.T)
 			Aliases: []string{"bad alias"},
 		}}
 
-		if err := store.Apply(t.Context(), endpoints); err == nil {
+		if _, err := store.Apply(t.Context(), endpoints); err == nil {
 			t.Fatal("Apply() error = nil, want endpoint validation error")
 		}
 		assertFileContent(t, target, []byte(old))
@@ -1349,7 +1550,7 @@ func TestStoreApplyValidationAndBackupFailuresLeaveTargetUnchanged(t *testing.T)
 			Aliases: []string{"radarr"},
 		}}
 
-		err := store.Apply(t.Context(), endpoints)
+		_, err := store.Apply(t.Context(), endpoints)
 		if !errors.Is(err, ops.failErr["write"]) {
 			t.Fatalf("Apply() error = %v, want backup write sentinel", err)
 		}
@@ -1363,7 +1564,7 @@ func TestStoreApplyValidationAndBackupFailuresLeaveTargetUnchanged(t *testing.T)
 		target, backup := createStoreFiles(t, corrupt, validBackup)
 		store := NewStore(target, backup, "DOCKER CONTAINERS", "saltbox")
 
-		if err := store.Apply(t.Context(), nil); err == nil {
+		if _, err := store.Apply(t.Context(), nil); err == nil {
 			t.Fatal("Apply() error = nil, want corrupt-target error")
 		}
 		assertFileContent(t, target, corrupt)
@@ -1384,7 +1585,7 @@ func TestStoreApplyLateTargetFailureRollsBackOnlyTarget(t *testing.T) {
 		Aliases: []string{"radarr"},
 	}}
 
-	err := store.Apply(t.Context(), endpoints)
+	_, err := store.Apply(t.Context(), endpoints)
 	if !errors.Is(err, ops.failErr["readback_open"]) {
 		t.Fatalf("Apply() error = %v, want target readback sentinel", err)
 	}
@@ -1417,7 +1618,7 @@ func TestStoreApplyCancellationAfterTargetRenameStillRollsBack(t *testing.T) {
 		Aliases: []string{"radarr"},
 	}}
 
-	err := store.Apply(ctx, endpoints)
+	_, err := store.Apply(ctx, endpoints)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Apply() error = %v, want context.Canceled", err)
 	}
@@ -1446,7 +1647,7 @@ func TestStoreApplyJoinsPrimaryAndRollbackFailures(t *testing.T) {
 		Aliases: []string{"radarr"},
 	}}
 
-	err := store.Apply(t.Context(), endpoints)
+	_, err := store.Apply(t.Context(), endpoints)
 	if !errors.Is(err, primarySentinel) {
 		t.Errorf("Apply() error = %v, want primary sentinel", err)
 	}

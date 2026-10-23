@@ -28,7 +28,7 @@ func TestRenderEndpointsUsesDefaultNetworkForBareAliases(t *testing.T) {
 		},
 	}
 
-	got, err := renderEndpoints(endpoints, "saltbox")
+	got, _, err := renderEndpoints(endpoints, "saltbox")
 	if err != nil {
 		t.Fatalf("renderEndpoints() error = %v", err)
 	}
@@ -52,7 +52,7 @@ func TestRenderEndpointsAlignsMixedIPColumns(t *testing.T) {
 		},
 	}
 
-	got, err := renderEndpoints(endpoints, "saltbox")
+	got, _, err := renderEndpoints(endpoints, "saltbox")
 	if err != nil {
 		t.Fatalf("renderEndpoints() error = %v", err)
 	}
@@ -76,7 +76,7 @@ func TestRenderEndpointsMovesBareAliasWithDefaultNetwork(t *testing.T) {
 		},
 	}
 
-	got, err := renderEndpoints(endpoints, "backend")
+	got, _, err := renderEndpoints(endpoints, "backend")
 	if err != nil {
 		t.Fatalf("renderEndpoints() error = %v", err)
 	}
@@ -182,7 +182,7 @@ func TestRenderEndpointsRejectsInvalidEndpointData(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := renderEndpoints(tt.endpoints, tt.defaultNetwork); err == nil {
+			if _, _, err := renderEndpoints(tt.endpoints, tt.defaultNetwork); err == nil {
 				t.Fatal("renderEndpoints() error = nil, want validation error")
 			}
 		})
@@ -215,7 +215,7 @@ func TestRenderEndpointsDoesNotMutateInput(t *testing.T) {
 		},
 	}
 
-	if _, err := renderEndpoints(endpoints, "saltbox"); err != nil {
+	if _, _, err := renderEndpoints(endpoints, "saltbox"); err != nil {
 		t.Fatalf("renderEndpoints() error = %v", err)
 	}
 	if len(endpoints) != len(want) {
