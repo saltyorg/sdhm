@@ -574,12 +574,13 @@ func TestEventsScopesAndMapsNetworkEvents(t *testing.T) {
 	api := newFakeAPI()
 	sourceEvents := make(chan events.Message, 1)
 	sourceErrors := make(chan error, 1)
-	ctx, cancel := context.WithCancel(t.Context())
+	type contextKey struct{}
+	ctx, cancel := context.WithCancel(context.WithValue(t.Context(), contextKey{}, "events"))
 	eventCalls := 0
 	api.eventsFn = func(gotCtx context.Context, opts mobyclient.EventsListOptions) mobyclient.EventsResult {
 		eventCalls++
-		if gotCtx != ctx {
-			t.Fatal("Events() did not pass its context to Docker")
+		if gotCtx.Value(contextKey{}) != "events" {
+			t.Fatal("Events() did not preserve caller context values")
 		}
 		assertFilterValue(t, opts.Filters, "type", "network")
 		assertFilterValue(t, opts.Filters, "event", "connect")

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/events"
@@ -18,7 +19,10 @@ import (
 
 var _ daemon.NetworkSource = (*Client)(nil)
 
-const maxConcurrentInspects = 8
+const (
+	maxConcurrentInspects = 8
+	eventHandshakeTimeout = 10 * time.Second
+)
 
 type inspectOutcome struct {
 	result mobyclient.ContainerInspectResult
@@ -35,8 +39,9 @@ type apiClient interface {
 
 // Client provides authoritative Docker network snapshots and change events.
 type Client struct {
-	api     apiClient
-	streams sync.WaitGroup
+	api              apiClient
+	streams          sync.WaitGroup
+	handshakeTimeout time.Duration
 }
 
 // New constructs a client for the default Docker host with API negotiation.
@@ -51,7 +56,7 @@ func New() (*Client, error) {
 }
 
 func newClient(api apiClient) *Client {
-	return &Client{api: api}
+	return &Client{api: api, handshakeTimeout: eventHandshakeTimeout}
 }
 
 // Ping verifies that the Docker daemon is reachable.
@@ -162,11 +167,23 @@ func (c *Client) Events(ctx context.Context, networks []string) (<-chan daemon.E
 		Add("type", "network").
 		Add("event", "connect", "disconnect").
 		Add("network", networks...)
-	source := c.api.Events(ctx, mobyclient.EventsListOptions{Filters: filters})
+	// Moby waits for response headers before Events returns. Limit that
+	// handshake, then leave the established stream alive until cancellation.
+	streamCtx, cancel := context.WithCancel(ctx)
+	handshake := time.AfterFunc(c.handshakeTimeout, cancel)
+	source := c.api.Events(streamCtx, mobyclient.EventsListOptions{Filters: filters})
+	if !handshake.Stop() {
+		cancel()
+		if ctx.Err() != nil {
+			return failedEventStream(ctx.Err())
+		}
+		return failedEventStream(fmt.Errorf("subscribe to Docker events: %w", context.DeadlineExceeded))
+	}
 	mappedEvents := make(chan daemon.Event, 1)
 	mappedErrors := make(chan error, 1)
 
 	c.streams.Go(func() {
+		defer cancel()
 		defer close(mappedEvents)
 		defer close(mappedErrors)
 
