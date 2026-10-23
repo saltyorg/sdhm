@@ -134,8 +134,8 @@ func validateFileConfig(hostsFile, backupFile, sectionName string) error {
 	if err := validateCleanPath("backup file", backupFile); err != nil {
 		return err
 	}
-	if hostsFile == backupFile {
-		return errors.New("hosts file and backup file must be different paths")
+	if err := validateDistinctFilePaths(hostsFile, backupFile); err != nil {
+		return err
 	}
 	if strings.TrimSpace(sectionName) == "" {
 		return errors.New("section name must be non-empty")

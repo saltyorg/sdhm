@@ -110,6 +110,8 @@ sdhm --hosts-file /tmp/test-hosts --networks bridge
 
 The resolved default network receives both `alias` and `alias.<network>` names. Every secondary network receives only `alias.<network>`, preventing bare-name collisions. `--default-network` must name a monitored network. When it is omitted, `saltbox` is preferred if present; otherwise the first configured network becomes the default. Existing startup commands using only `--networks`, `--interval`, and `--health-port` therefore require no new flag.
 
+The hosts and backup paths must identify different destinations, including when relative paths or symlinked parent directories refer to the same destination. The backup cannot use the adjacent `<hosts-file>.sdhm.lock` path reserved for writer exclusion. SDHM rejects these configurations before acquiring the lock or modifying either file.
+
 ### Time Duration Formats
 
 Interval and debounce values accept positive, case-sensitive Go durations, including milliseconds and compound values such as `500ms`, `1m30s`, and `2h15m`. Exact positive integer days such as `1d` or `7d` are also accepted. Zero and negative durations are rejected.

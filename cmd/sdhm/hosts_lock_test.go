@@ -1,12 +1,77 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/saltyorg/sdhm/command"
 )
+
+func TestOverlappingBackupConfigurationPreservesHeldWriterLock(t *testing.T) {
+	for _, regenerate := range []bool{false, true} {
+		mode := "daemon"
+		if regenerate {
+			mode = "regenerate"
+		}
+		t.Run(mode, func(t *testing.T) {
+			hostsPath := filepath.Join(t.TempDir(), "hosts")
+			const original = "127.0.0.1 localhost\n# BEGIN DOCKER CONTAINERS\n# END DOCKER CONTAINERS\n"
+			if err := os.WriteFile(hostsPath, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			first, err := acquireHostsLock(hostsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = first.Close() }()
+			lockPath := hostsPath + hostsLockSuffix
+			before, err := os.Lstat(lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			root := command.NewRoot("test",
+				func(context.Context, command.Config) error { called = true; return nil },
+				func(context.Context, command.RegenerateConfig) error { called = true; return nil },
+			)
+			var output bytes.Buffer
+			root.SetOut(&output)
+			root.SetErr(&output)
+			args := []string{"--hosts-file", hostsPath, "--backup-file", lockPath}
+			if regenerate {
+				args = append([]string{"regenerate"}, args...)
+			}
+			root.SetArgs(args)
+			if err := root.ExecuteContext(t.Context()); err == nil || !strings.Contains(err.Error(), "writer lock") {
+				t.Errorf("ExecuteContext() error = %v, want writer-lock collision rejection", err)
+			}
+			if called {
+				t.Error("runtime called for backup overlapping the held lock")
+			}
+			after, err := os.Lstat(lockPath)
+			if err != nil || !os.SameFile(before, after) {
+				t.Fatalf("writer lock inode changed: error %v", err)
+			}
+			second, err := acquireHostsLock(hostsPath)
+			if err == nil {
+				_ = second.Close()
+			}
+			if !errors.Is(err, errHostsLocked) {
+				t.Errorf("second writer lock error = %v, want %v", err, errHostsLocked)
+			}
+			data, err := os.ReadFile(hostsPath)
+			if err != nil || string(data) != original {
+				t.Errorf("hosts contents = %q, error %v, want unchanged target", data, err)
+			}
+		})
+	}
+}
 
 func TestAcquireHostsLockExcludesSamePathUntilClose(t *testing.T) {
 	hostsPath := filepath.Join(t.TempDir(), "hosts")

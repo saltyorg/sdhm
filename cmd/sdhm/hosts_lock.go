@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"github.com/saltyorg/sdhm/command"
 )
 
-const hostsLockSuffix = ".sdhm.lock"
+const hostsLockSuffix = command.HostsLockSuffix
 
 var errHostsLocked = errors.New("hosts file is locked by another SDHM process")
 
