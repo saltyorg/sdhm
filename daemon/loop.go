@@ -9,13 +9,8 @@ const eventStreamClosedMessage = "Docker event stream closed"
 
 func (d *Daemon) loop(
 	ctx context.Context,
-	initialReconcileErr error,
+	state *loopState,
 ) (error, bool) {
-	state := newLoopState(d, ctx, initialReconcileErr)
-	state.startStream()
-	if state.events == nil && state.eventErrors == nil {
-		state.disconnectStream(nil)
-	}
 	defer state.close()
 
 	for {
@@ -58,8 +53,8 @@ func (d *Daemon) loop(
 				continue
 			}
 			state.startStream()
-			if state.events == nil && state.eventErrors == nil {
-				state.disconnectStream(nil)
+			if state.events != nil || state.eventErrors != nil {
+				state.pending = true
 			}
 		case <-loopTimerChannel(state.stabilityTimer):
 			state.handleStability()

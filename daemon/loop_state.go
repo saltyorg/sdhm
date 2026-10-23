@@ -37,12 +37,17 @@ func newLoopState(daemon *Daemon, ctx context.Context, initialReconcileErr error
 		retryDelay:     daemon.timing.retryInitialDelay,
 		reconnectDelay: daemon.timing.retryInitialDelay,
 	}
-	if initialReconcileErr != nil {
-		state.lastReconcileFailure = initialReconcileErr.Error()
-		state.retryTimer = resetLoopTimer(state.retryTimer, state.retryDelay)
-		state.retryDelay = nextLoopBackoff(state.retryDelay, daemon.timing.retryMaxDelay)
-	}
+	state.recordInitialReconciliation(initialReconcileErr)
 	return state
+}
+
+func (s *loopState) recordInitialReconciliation(err error) {
+	s.periodicTimer = resetLoopTimer(s.periodicTimer, s.daemon.config.PeriodicInterval)
+	if err != nil {
+		s.lastReconcileFailure = err.Error()
+		s.retryTimer = resetLoopTimer(s.retryTimer, s.retryDelay)
+		s.retryDelay = nextLoopBackoff(s.retryDelay, s.daemon.timing.retryMaxDelay)
+	}
 }
 
 func (s *loopState) close() {
@@ -79,6 +84,14 @@ func (s *loopState) startStream() {
 		s.cancelStream()
 		s.events = nil
 		s.eventErrors = nil
+		return
+	}
+	if s.events == nil && s.eventErrors == nil {
+		s.disconnectStream(nil)
+		return
+	}
+	if err, ready := s.streamErrorReady(); ready {
+		s.disconnectStream(err)
 		return
 	}
 	s.stabilityTimer = resetLoopTimer(s.stabilityTimer, s.daemon.timing.streamStabilityDelay)
@@ -127,6 +140,21 @@ func (s *loopState) streamErrorReady() (error, bool) {
 		return err, true
 	default:
 		return nil, false
+	}
+}
+
+func (s *loopState) observeBufferedStream() {
+	if s.events == nil && s.eventErrors == nil {
+		return
+	}
+	if err, ready := s.streamErrorReady(); ready {
+		s.disconnectStream(err)
+		return
+	}
+	select {
+	case _, open := <-s.events:
+		s.handleEvent(open)
+	default:
 	}
 }
 

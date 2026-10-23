@@ -71,8 +71,12 @@ func (d *Daemon) Run(parent context.Context) error {
 	ctx, cancel := context.WithCancel(parent)
 	serverStarted := false
 	var watcherDone <-chan struct{}
+	var state *loopState
 	finish := func(runErr error, serveErrCaptured bool) error {
 		cancel()
+		if state != nil {
+			state.close()
+		}
 		if watcherDone != nil {
 			<-watcherDone
 		}
@@ -137,10 +141,17 @@ func (d *Daemon) Run(parent context.Context) error {
 		return finish(runErr, captured)
 	}
 
+	state = newLoopState(d, ctx, nil)
+	state.startStream()
+	if stop, captured, runErr := d.startupStop(parent); stop {
+		return finish(runErr, captured)
+	}
 	initialReconcileErr := d.reconcile(ctx)
 	if stop, captured, runErr := d.startupStop(parent); stop {
 		return finish(runErr, captured)
 	}
+	state.recordInitialReconciliation(initialReconcileErr)
+	state.observeBufferedStream()
 	if parent.Err() == nil && ctx.Err() == nil {
 		d.tracker.CompleteInitialization()
 		if initialReconcileErr == nil {
@@ -158,7 +169,7 @@ func (d *Daemon) Run(parent context.Context) error {
 		return finish(runErr, captured)
 	}
 
-	runErr, serveErrCaptured := d.loop(ctx, initialReconcileErr)
+	runErr, serveErrCaptured := d.loop(ctx, state)
 	return finish(runErr, serveErrCaptured)
 }
 

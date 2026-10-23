@@ -91,6 +91,9 @@ func (s *orderedSource) Events(ctx context.Context, networks []string) (<-chan E
 	if s.onEvents != nil {
 		s.onEvents(ctx, slices.Clone(networks))
 	}
+	if s.events == nil && s.eventErrors == nil {
+		return make(chan Event), make(chan error)
+	}
 	return s.events, s.eventErrors
 }
 
@@ -405,7 +408,6 @@ func TestRunRealHealthListenerWaitsForInitialReconciliation(t *testing.T) {
 	releaseSnapshot := make(chan struct{})
 	applyStarted := make(chan struct{})
 	releaseApply := make(chan struct{})
-	loopStarted := make(chan struct{})
 	events := make(chan Event)
 	eventErrors := make(chan error)
 
@@ -419,9 +421,6 @@ func TestRunRealHealthListenerWaitsForInitialReconciliation(t *testing.T) {
 			case <-releaseSnapshot:
 			case <-ctx.Done():
 			}
-		},
-		onEvents: func(context.Context, []string) {
-			close(loopStarted)
 		},
 	}
 	store := &orderedStore{
@@ -443,7 +442,8 @@ func TestRunRealHealthListenerWaitsForInitialReconciliation(t *testing.T) {
 	}
 	server := health.NewServer("127.0.0.1:0", health.NewHandler(tracker))
 	ctx, cancel := context.WithCancel(t.Context())
-	daemon := mustNewDaemon(t, validConfig(), source, store, tracker, server)
+	recorder := newNotifyingLogRecorder()
+	daemon := mustNewDaemonWithLogger(t, validConfig(), source, store, tracker, server, slog.New(recorder))
 	result := make(chan error, 1)
 	go func() { result <- daemon.Run(ctx) }()
 
@@ -458,7 +458,7 @@ func TestRunRealHealthListenerWaitsForInitialReconciliation(t *testing.T) {
 	<-applyStarted
 	assertInitializingHealth(t, client, healthURL, "hosts apply")
 	close(releaseApply)
-	<-loopStarted
+	waitForInitialReconciliation(t, recorder)
 	assertReadyHealth(t, client, healthURL)
 
 	cancel()
@@ -494,31 +494,29 @@ func TestRunInitialReconciliationFailureCompletesInitializationWithActiveConcern
 			log := &operationLog{}
 			events := make(chan Event)
 			eventErrors := make(chan error)
-			loopStarted := make(chan struct{})
 			source := &orderedSource{
 				log:         log,
 				events:      events,
 				eventErrors: eventErrors,
-				onEvents: func(context.Context, []string) {
-					close(loopStarted)
-				},
 			}
 			store := &orderedStore{log: log}
 			tt.configure(source, store)
 			tracker := health.NewTracker()
 			ctx, cancel := context.WithCancel(t.Context())
-			daemon := mustNewDaemon(
+			logs := newNotifyingLogRecorder()
+			daemon := mustNewDaemonWithLogger(
 				t,
 				validConfig(),
 				source,
 				store,
 				tracker,
 				newOrderedHealthServer(log),
+				slog.New(logs),
 			)
 			result := make(chan error, 1)
 			go func() { result <- daemon.Run(ctx) }()
 
-			<-loopStarted
+			waitForInitialReconciliation(t, logs)
 			assertReadiness(t, tracker, true)
 			assertActiveConcerns(t, tracker, tt.concern)
 			recorder := httptest.NewRecorder()
@@ -537,17 +535,13 @@ func TestRunInitialReconciliationFailureCompletesInitializationWithActiveConcern
 
 func TestRunLogsReadyAfterSuccessfulInitialReconciliation(t *testing.T) {
 	log := &operationLog{}
-	loopStarted := make(chan struct{})
 	source := &orderedSource{
 		log:         log,
 		events:      make(chan Event),
 		eventErrors: make(chan error),
-		onEvents: func(context.Context, []string) {
-			close(loopStarted)
-		},
 	}
 	tracker := health.NewTracker()
-	recorder := newLogRecorder()
+	recorder := newNotifyingLogRecorder()
 	daemon, err := New(
 		validConfig(),
 		source,
@@ -564,7 +558,7 @@ func TestRunLogsReadyAfterSuccessfulInitialReconciliation(t *testing.T) {
 	result := make(chan error, 1)
 	go func() { result <- daemon.Run(ctx) }()
 
-	<-loopStarted
+	waitForInitialReconciliation(t, recorder)
 	assertReadiness(t, tracker, true)
 	if records := logRecords(recorder.Records(), slog.LevelInfo, "SDHM ready"); len(records) != 1 {
 		t.Fatalf("SDHM ready records = %d, want 1 after Apply returned", len(records))
@@ -579,17 +573,13 @@ func TestRunLogsReadyAfterSuccessfulInitialReconciliation(t *testing.T) {
 func TestRunLogsInitialReconciliationFailure(t *testing.T) {
 	log := &operationLog{}
 	failure := errors.New("snapshot sentinel")
-	loopStarted := make(chan struct{})
 	source := &orderedSource{
 		log:         log,
 		snapshotErr: failure,
 		events:      make(chan Event),
 		eventErrors: make(chan error),
-		onEvents: func(context.Context, []string) {
-			close(loopStarted)
-		},
 	}
-	recorder := newLogRecorder()
+	recorder := newNotifyingLogRecorder()
 	daemon, err := New(
 		validConfig(),
 		source,
@@ -606,7 +596,7 @@ func TestRunLogsInitialReconciliationFailure(t *testing.T) {
 	result := make(chan error, 1)
 	go func() { result <- daemon.Run(ctx) }()
 
-	<-loopStarted
+	waitForInitialReconciliation(t, recorder)
 	failures := logRecords(recorder.Records(), slog.LevelWarn, "reconciliation failed")
 	if len(failures) != 1 {
 		t.Fatalf("initial reconciliation failure records = %d, want 1", len(failures))

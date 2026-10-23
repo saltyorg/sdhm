@@ -218,9 +218,9 @@ Live systemd journal-priority acceptance passed on 2026-09-02 for reviewed code 
 
 ## How It Works
 
-1. **Startup**: SDHM pings Docker, binds the health listener in an initializing 503 state, validates or prepares the managed hosts section, and attempts one authoritative reconciliation before reporting readiness or starting background work
+1. **Startup**: SDHM pings Docker, binds the health listener in an initializing 503 state, validates or prepares the managed hosts section, subscribes to network events, and attempts one authoritative reconciliation before completing initialization. Subscription establishment has a ten-second timeout; an unavailable stream degrades health while snapshot reconciliation continues. An established stream has no ten-second lifetime limit
 2. **Discovery**: One authoritative list/inspect pass gathers every publishable endpoint on the configured networks. Container-list or non-not-found inspect failures preserve the current hosts file, while endpoints without usable settings, an IP address, or aliases are omitted because they have no valid hosts mapping. In the verified crash-loop case, Docker kept the restarting container listed while clearing its IP, so omission prevents it from blocking healthy updates
-3. **Scheduling**: Network events are debounced, periodic validation requests immediate reconciliation, and failed work retries with bounded backoff
+3. **Scheduling**: Network events are debounced, periodic validation requests immediate reconciliation, and failed work retries with bounded backoff. A reconnected event stream requests an immediate full snapshot to reconcile changes missed during the outage
 4. **Hosts File Update**: The complete publishable snapshot replaces one managed section while preserving every byte outside it:
    ```
    # BEGIN DOCKER CONTAINERS

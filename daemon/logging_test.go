@@ -11,6 +11,7 @@ import (
 type logRecorder struct {
 	mu      sync.Mutex
 	records []slog.Record
+	notify  chan struct{}
 }
 
 type logRecordingHandler struct {
@@ -63,6 +64,12 @@ func (r *logRecorder) record(record slog.Record) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.records = append(r.records, record.Clone())
+	if r.notify != nil {
+		select {
+		case r.notify <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (r *logRecorder) WithAttrs(attrs []slog.Attr) slog.Handler {

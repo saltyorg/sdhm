@@ -185,7 +185,7 @@ func newLoopTestHarnessWith(
 	source.streams <- stream
 	log := &operationLog{}
 	server := newOrderedHealthServer(log)
-	recorder := newLogRecorder()
+	recorder := newNotifyingLogRecorder()
 	daemon := mustNewDaemonWithLogger(
 		t,
 		cfg,
@@ -217,6 +217,7 @@ func (h *loopTestHarness) start(t *testing.T) (loopTestSnapshot, loopTestStreamC
 	t.Helper()
 	initial := receiveLoopValue(t, h.source.snapshots, "initial reconciliation")
 	stream := receiveLoopValue(t, h.source.streamCalls, "initial event stream")
+	waitForInitialReconciliation(t, h.recorder)
 	return initial, stream
 }
 
@@ -581,7 +582,9 @@ func TestLoopHealthServerStopDuringFailedRuntimeReconciliationSuppressesTransiti
 		defer cancel()
 		result := make(chan loopTestResult, 1)
 		go func() {
-			err, captured := daemon.loop(ctx, nil)
+			state := newLoopState(daemon, ctx, nil)
+			state.startStream()
+			err, captured := daemon.loop(ctx, state)
 			result <- loopTestResult{err: err, serveErrCaptured: captured}
 		}()
 		receiveLoopValue(t, source.streamCalls, "initial event stream")
@@ -651,7 +654,9 @@ func TestLoopHealthServerStopDuringRecoveredRuntimeReconciliationSuppressesTrans
 		defer cancel()
 		result := make(chan loopTestResult, 1)
 		go func() {
-			err, captured := daemon.loop(ctx, initialReconcileErr)
+			state := newLoopState(daemon, ctx, initialReconcileErr)
+			state.startStream()
+			err, captured := daemon.loop(ctx, state)
 			result <- loopTestResult{err: err, serveErrCaptured: captured}
 		}()
 		receiveLoopValue(t, source.streamCalls, "initial event stream")
@@ -914,10 +919,10 @@ func assertReadyStopResult(t *testing.T, harness *loopTestHarness, wantErr error
 	}
 }
 
-func assertNoLoopWorkScheduled(t *testing.T, harness *loopTestHarness) {
+func assertNoLoopWorkScheduled(t *testing.T, harness *loopTestHarness, wantSnapshots int64) {
 	t.Helper()
-	if calls := harness.source.snapshotCount.Load(); calls != 1 {
-		t.Fatalf("Snapshot() calls = %d, want only initial reconciliation", calls)
+	if calls := harness.source.snapshotCount.Load(); calls != wantSnapshots {
+		t.Fatalf("Snapshot() calls = %d, want %d completed before stop", calls, wantSnapshots)
 	}
 	select {
 	case call := <-harness.source.streamCalls:
@@ -953,7 +958,7 @@ func TestLoopSuppressesReadyStopStreamErrorTransition(t *testing.T) {
 					t.Fatalf("event stream health history = %d, want 0", len(history))
 				}
 				assertEventStreamTransitionRecords(t, harness.recorder, 0, 0)
-				assertNoLoopWorkScheduled(t, harness)
+				assertNoLoopWorkScheduled(t, harness, 1)
 			})
 		})
 	}
@@ -977,7 +982,7 @@ func TestLoopSuppressesReadyStopEventTransition(t *testing.T) {
 					t.Fatalf("event stream health history = %d, want only the original failure", len(history))
 				}
 				assertEventStreamTransitionRecords(t, harness.recorder, 1, 0)
-				assertNoLoopWorkScheduled(t, harness)
+				assertNoLoopWorkScheduled(t, harness, 2)
 			})
 		})
 	}
@@ -1002,7 +1007,7 @@ func TestLoopSuppressesReadyStopStabilityTransition(t *testing.T) {
 					t.Fatalf("event stream health history = %d, want only the original failure", len(history))
 				}
 				assertEventStreamTransitionRecords(t, harness.recorder, 1, 0)
-				assertNoLoopWorkScheduled(t, harness)
+				assertNoLoopWorkScheduled(t, harness, 2)
 			})
 		})
 	}
@@ -1027,7 +1032,7 @@ func TestLoopSuppressesReadyStopReconnectTransition(t *testing.T) {
 					t.Fatalf("event stream health history = %d, want only the original failure", len(history))
 				}
 				assertEventStreamTransitionRecords(t, harness.recorder, 1, 0)
-				assertNoLoopWorkScheduled(t, harness)
+				assertNoLoopWorkScheduled(t, harness, 1)
 			})
 		})
 	}
@@ -1310,7 +1315,7 @@ func TestLoopStreamFailureOutranksExpiredStabilityAfterBlockedReconcile(t *testi
 			store := newLoopTestStore()
 			releaseApply := make(chan struct{})
 			store.onApply = func(ctx context.Context, call int) error {
-				if call != 2 {
+				if call != 4 {
 					return nil
 				}
 				select {
@@ -1332,15 +1337,23 @@ func TestLoopStreamFailureOutranksExpiredStabilityAfterBlockedReconcile(t *testi
 			source.streams <- secondStream
 			failLoopTestStream(harness.stream, errors.New("first stream failure"))
 			receiveLoopValue(t, source.streamCalls, "first reconnected stream")
+			receiveLoopValue(t, source.snapshots, "first reconnect reconciliation")
+			if call := receiveLoopValue(t, store.applyCalls, "first reconnect apply"); call != 2 {
+				t.Fatalf("first reconnect Apply() call = %d, want 2", call)
+			}
 
 			thirdStream := newLoopTestStream()
 			source.streams <- thirdStream
 			failLoopTestStream(secondStream, errors.New("second stream failure"))
 			thirdCall := receiveLoopValue(t, source.streamCalls, "second reconnected stream")
+			receiveLoopValue(t, source.snapshots, "second reconnect reconciliation")
+			if call := receiveLoopValue(t, store.applyCalls, "second reconnect apply"); call != 3 {
+				t.Fatalf("second reconnect Apply() call = %d, want 3", call)
+			}
 
 			receiveLoopValue(t, source.snapshots, "periodic reconciliation before stability race")
-			if call := receiveLoopValue(t, store.applyCalls, "blocked apply before stability race"); call != 2 {
-				t.Fatalf("blocked Apply() call = %d, want 2", call)
+			if call := receiveLoopValue(t, store.applyCalls, "blocked apply before stability race"); call != 4 {
+				t.Fatalf("blocked Apply() call = %d, want 4", call)
 			}
 
 			failureAt := thirdCall.at.Add(streamStabilityDelay - time.Second)
@@ -1419,17 +1432,23 @@ func TestLoopReadyStopOutranksPendingPeriodicReconciliation(t *testing.T) {
 					source := newLoopTestSource()
 					streamBlocked := make(chan struct{}, 1)
 					releaseStream := make(chan struct{})
-					source.onEvents = func(_ context.Context, call int) {
-						if call != 1 {
+					source.onEvents = func(ctx context.Context, call int) {
+						if call != 2 {
 							return
 						}
 						streamBlocked <- struct{}{}
-						<-releaseStream
+						select {
+						case <-releaseStream:
+						case <-ctx.Done():
+						}
 					}
 					harness := newLoopTestHarnessWith(t, cfg, source, newLoopTestStore(), health.NewTracker(), nil)
 					defer func() { _ = harness.shutdown(t) }()
 					harness.start(t)
-					receiveLoopValue(t, streamBlocked, "blocked initial event stream")
+					source.streams <- newLoopTestStream()
+					failLoopTestStream(harness.stream, errors.New("stream failure before periodic stop"))
+					receiveLoopValue(t, streamBlocked, "blocked reconnect")
+					completedSnapshots := source.snapshotCount.Load()
 					serveErr := errors.New("serve failure")
 
 					advanceLoopTime(t, cfg.PeriodicInterval)
@@ -1444,8 +1463,8 @@ func TestLoopReadyStopOutranksPendingPeriodicReconciliation(t *testing.T) {
 					} else if !errors.Is(err, serveErr) {
 						t.Fatalf("Run() error = %v, want wrapped %v", err, serveErr)
 					}
-					if calls := harness.source.snapshotCount.Load(); calls != 1 {
-						t.Fatalf("Snapshot() calls = %d, want only initial reconciliation", calls)
+					if calls := harness.source.snapshotCount.Load(); calls != completedSnapshots {
+						t.Fatalf("Snapshot() calls = %d, want %d completed before stop", calls, completedSnapshots)
 					}
 				}
 			})
