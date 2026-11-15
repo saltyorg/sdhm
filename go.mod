@@ -4,8 +4,8 @@ go 1.27.3
 
 require (
 	github.com/containerd/errdefs v1.0.0
-	github.com/moby/moby/api v1.56.1
-	github.com/moby/moby/client v0.6.2
+	github.com/moby/moby/api v1.57.0
+	github.com/moby/moby/client v0.6.3
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/sync v0.24.0
 )
